@@ -138,6 +138,21 @@ bool SDCard::loadConfigFile(TSettings* Settings)
                     } else {
                         Settings->rearLedEnabled = false;
                     }
+                    if (json.containsKey(JSON_KEY_THEME)) {
+                        Settings->themeMode = json[JSON_KEY_THEME].as<int>();
+                    } else {
+                        Settings->themeMode = 0;
+                    }
+                    if (json.containsKey(JSON_KEY_FLIPSCREEN)) {
+                        Settings->flipScreen = json[JSON_KEY_FLIPSCREEN].as<bool>();
+                    } else {
+                        Settings->flipScreen = false;
+                    }
+                    if (json.containsKey(JSON_KEY_AUTOSCREENROTATION)) {
+                        Settings->autoScreenRotation = json[JSON_KEY_AUTOSCREENROTATION].as<bool>();
+                    } else {
+                        Settings->autoScreenRotation = false;
+                    }
                     // Serial.printf("Carteira Lida SD:%s\n", Settings.BtcWallet);       
                     Serial.printf("Carteira Lida SDs:%s\n", Settings->BtcWallet);                       
                     return true;

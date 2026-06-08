@@ -38,6 +38,9 @@ bool nvMemory::saveConfig(TSettings* Settings)
         json[JSON_SPIFFS_KEY_INVCOLOR] = Settings->invertColors;
         json[JSON_SPIFFS_KEY_BRIGHTNESS] = Settings->Brightness;
         json[JSON_SPIFFS_KEY_REARLED] = Settings->rearLedEnabled;
+        json[JSON_SPIFFS_KEY_THEME] = Settings->themeMode;
+        json[JSON_SPIFFS_KEY_FLIPSCREEN] = Settings->flipScreen;
+        json[JSON_SPIFFS_KEY_AUTOSCREENROTATION] = Settings->autoScreenRotation;
 
         // Open config file
         File configFile = SPIFFS.open(JSON_CONFIG_FILE, "w");
@@ -114,6 +117,21 @@ bool nvMemory::loadConfig(TSettings* Settings)
                         Settings->rearLedEnabled = json[JSON_SPIFFS_KEY_REARLED].as<bool>();
                     } else {
                         Settings->rearLedEnabled = false;
+                    }
+                    if (json.containsKey(JSON_SPIFFS_KEY_THEME)) {
+                        Settings->themeMode = json[JSON_SPIFFS_KEY_THEME].as<int>();
+                    } else {
+                        Settings->themeMode = 0;
+                    }
+                    if (json.containsKey(JSON_SPIFFS_KEY_FLIPSCREEN)) {
+                        Settings->flipScreen = json[JSON_SPIFFS_KEY_FLIPSCREEN].as<bool>();
+                    } else {
+                        Settings->flipScreen = false;
+                    }
+                    if (json.containsKey(JSON_SPIFFS_KEY_AUTOSCREENROTATION)) {
+                        Settings->autoScreenRotation = json[JSON_SPIFFS_KEY_AUTOSCREENROTATION].as<bool>();
+                    } else {
+                        Settings->autoScreenRotation = false;
                     }
                     return true;
                 }

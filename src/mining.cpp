@@ -19,9 +19,17 @@
 #include "mbedtls/sha256.h"
 #include "i2c_master.h"
 
-//10 Jobs per second
-#define NONCE_PER_JOB_SW 4096
-#define NONCE_PER_JOB_HW 16*1024
+// Throughput tuning: larger nonce chunks reduce scheduler/queue overhead.
+#define NONCE_PER_JOB_SW (16 * 1024)
+#define NONCE_PER_JOB_HW (64 * 1024)
+#define MINER_JOB_QUEUE_DEPTH 8
+#define MINER_CTRL_DELAY_ACTIVE_MS 5
+#define MINER_CTRL_DELAY_IDLE_MS 20
+#define MINER_WORKER_EMPTY_DELAY_MS 1
+
+#ifndef MINER_VERBOSE_SHARE_LOG
+#define MINER_VERBOSE_SHARE_LOG 0
+#endif
 
 //#define I2C_SLAVE
 
@@ -48,6 +56,11 @@ uint32_t Mhashes = 0;
 uint32_t totalKHashes = 0;
 uint32_t elapsedKHs = 0;
 uint64_t upTime = 0;
+volatile uint32_t submitAttempts = 0;
+volatile double currentPoolDifficultyLive = DEFAULT_DIFFICULTY;
+volatile uint32_t perfCtrlActiveLoops = 0;
+volatile uint32_t perfCtrlIdleLoops = 0;
+volatile uint32_t perfCtrlYields = 0;
 
 volatile uint32_t shares; // increase if blockhash has 32 bits of zeroes
 volatile uint32_t valids; // increased if blockhash <= target
@@ -73,6 +86,8 @@ unsigned long mLastTXtoPool = millis();
 int saveIntervals[7] = {5 * 60, 15 * 60, 30 * 60, 1 * 3600, 3 * 3600, 6 * 3600, 12 * 3600};
 int saveIntervalsSize = sizeof(saveIntervals)/sizeof(saveIntervals[0]);
 int currentIntervalIndex = 0;
+unsigned long lastPoolDnsRefreshMs = 0;
+const unsigned long POOL_DNS_REFRESH_MS = 15UL * 60UL * 1000UL;
 
 bool checkPoolConnection(void) {
   
@@ -83,18 +98,31 @@ bool checkPoolConnection(void) {
   isMinerSuscribed = false;
 
   Serial.println("Client not connected, trying to connect..."); 
-  
-  //Resolve first time pool DNS and save IP
-  if(serverIP == IPAddress(1,1,1,1)) {
-    WiFi.hostByName(Settings.PoolAddress.c_str(), serverIP);
-    Serial.printf("Resolved DNS and save ip (first time) got: %s\n", serverIP.toString());
-  }
 
+  const unsigned long now = millis();
+  const bool shouldRefreshDns =
+      (serverIP == IPAddress(1, 1, 1, 1)) ||
+      (lastPoolDnsRefreshMs == 0) ||
+      ((now - lastPoolDnsRefreshMs) >= POOL_DNS_REFRESH_MS);
+
+  if (shouldRefreshDns) {
+    if (WiFi.hostByName(Settings.PoolAddress.c_str(), serverIP)) {
+      lastPoolDnsRefreshMs = now;
+      Serial.printf("Resolved DNS refresh got: %s\n", serverIP.toString().c_str());
+    } else {
+      Serial.println("Pool DNS refresh failed");
+    }
+  }
+  
   //Try connecting pool IP
   if (!client.connect(serverIP, Settings.PoolPort)) {
     Serial.println("Imposible to connect to : " + Settings.PoolAddress);
-    WiFi.hostByName(Settings.PoolAddress.c_str(), serverIP);
-    Serial.printf("Resolved DNS got: %s\n", serverIP.toString());
+    if (WiFi.hostByName(Settings.PoolAddress.c_str(), serverIP)) {
+      lastPoolDnsRefreshMs = now;
+      Serial.printf("Resolved DNS retry got: %s\n", serverIP.toString().c_str());
+    } else {
+      Serial.println("Pool DNS retry failed");
+    }
     return false;
   }
 
@@ -247,11 +275,14 @@ void runStratumWorker(void *name) {
 
   // connect to pool  
   double currentPoolDifficulty = DEFAULT_DIFFICULTY;
+  currentPoolDifficultyLive = currentPoolDifficulty;
   uint32_t nonce_pool = 0;
   uint32_t job_pool = 0xFFFFFFFF;
   uint32_t last_job_time = millis();
 
   while(true) {
+    bool shouldYield = false;
+    bool activeLoop = false;
       
     if(WiFi.status() != WL_CONNECTED){
       // WiFi is disconnected, so reconnect now
@@ -395,7 +426,7 @@ void runStratumWorker(void *name) {
 
                                           {
                                             std::lock_guard<std::mutex> lock(s_job_mutex);
-                                            for (int i = 0; i < 4; ++ i)
+                                            for (int i = 0; i < MINER_JOB_QUEUE_DEPTH; ++ i)
                                             {
                                               #if 1
                                               JobPush( s_job_request_list_sw, job_pool, nonce_pool, NONCE_PER_JOB_SW, currentPoolDifficulty, mMiner.bytearray_blockheader, diget_mid, bake);
@@ -424,6 +455,7 @@ void runStratumWorker(void *name) {
                                           //For i2c slave we give nonces from 0x20000000, that is 0x10000000 nonces per slave
                                           i2c_feed_slaves(i2c_slave_vector, job_pool & 0xFF, 0x20, currentPoolDifficulty, mMiner.bytearray_blockheader);
                                           #endif
+                                            shouldYield = true;
                                       } else
                                       {
                                         Serial.println("Parsing error, need restart");
@@ -432,7 +464,9 @@ void runStratumWorker(void *name) {
                                         MiningJobStop(job_pool, s_submition_map);
                                       }
                                       break;
-          case MINING_SET_DIFFICULTY: parse_mining_set_difficulty(line, currentPoolDifficulty);
+          case MINING_SET_DIFFICULTY: if (parse_mining_set_difficulty(line, currentPoolDifficulty)) {
+                                        currentPoolDifficultyLive = currentPoolDifficulty;
+                                      }
                                       break;
           case STRATUM_SUCCESS:       {
                                         unsigned long id = parse_extract_id(line);
@@ -471,12 +505,10 @@ void runStratumWorker(void *name) {
     #ifdef I2C_SLAVE
     if (i2c_slave_vector.empty() || job_pool == 0xFFFFFFFF)
     {
-      vTaskDelay(50 / portTICK_PERIOD_MS); //Small delay
+      vTaskDelay(MINER_CTRL_DELAY_IDLE_MS / portTICK_PERIOD_MS);
     } else
     {
-      uint32_t time_start = millis();
       i2c_hit_slaves(i2c_slave_vector);
-      vTaskDelay(5 / portTICK_PERIOD_MS);
       uint32_t nonces_done = 0;
       std::vector<uint32_t> nonce_vector = i2c_harvest_slaves(i2c_slave_vector, job_pool & 0xFF, nonces_done);
       hashes += nonces_done;
@@ -493,30 +525,23 @@ void runStratumWorker(void *name) {
           job_result_list.push_back(result);
         }
       }
-      uint32_t time_end = millis();
-      //if (nonces_done > 16384)
-        //Serial.printf("Harvest slaves in %dms hashes=%d\n", time_end - time_start, nonces_done);
-      if (time_end > time_start)
-      {
-        uint32_t elapsed = time_end - time_start;
-        if (elapsed < 50)
-          vTaskDelay((50 - elapsed) / portTICK_PERIOD_MS);
-      } else
-        vTaskDelay(40 / portTICK_PERIOD_MS);
+      // no active-delay throttling during mining
     }
     #else
-    vTaskDelay(50 / portTICK_PERIOD_MS); //Small delay
+    if (job_pool == 0xFFFFFFFF)
+      vTaskDelay(MINER_CTRL_DELAY_IDLE_MS / portTICK_PERIOD_MS);
     #endif
 
     
     if (job_pool != 0xFFFFFFFF)
     {
+      activeLoop = true;
       std::lock_guard<std::mutex> lock(s_job_mutex);
       job_result_list.insert(job_result_list.end(), s_job_result_list.begin(), s_job_result_list.end());
       s_job_result_list.clear();
 
 #if 1
-      while (s_job_request_list_sw.size() < 4)
+      while (s_job_request_list_sw.size() < MINER_JOB_QUEUE_DEPTH)
       {
         JobPush( s_job_request_list_sw, job_pool, nonce_pool, NONCE_PER_JOB_SW, currentPoolDifficulty, mMiner.bytearray_blockheader, diget_mid, bake);
         #ifdef RANDOM_NONCE
@@ -528,7 +553,7 @@ void runStratumWorker(void *name) {
 #endif
 
       #ifdef HARDWARE_SHA265
-      while (s_job_request_list_hw.size() < 4)
+      while (s_job_request_list_hw.size() < MINER_JOB_QUEUE_DEPTH)
       {
         #if defined(CONFIG_IDF_TARGET_ESP32)
           JobPush( s_job_request_list_hw, job_pool, nonce_pool, NONCE_PER_JOB_HW, currentPoolDifficulty, sha_buffer_swap, hw_midstate, bake);
@@ -556,12 +581,15 @@ void runStratumWorker(void *name) {
           break;
         unsigned long sumbit_id = 0;
         tx_mining_submit(client, mWorker, mJob, res->nonce, sumbit_id);
+        submitAttempts++;
+        #if MINER_VERBOSE_SHARE_LOG
         Serial.print("   - Current diff share: "); Serial.println(res->difficulty,12);
         Serial.print("   - Current pool diff : "); Serial.println(currentPoolDifficulty,12);
         Serial.print("   - TX SHARE: ");
         for (size_t i = 0; i < 32; i++)
-            Serial.printf("%02x", res->hash[i]);
+          Serial.printf("%02x", res->hash[i]);
         Serial.println("");
+        #endif
         mLastTXtoPool = millis();
 
         std::shared_ptr<Submition> submition = std::make_shared<Submition>();
@@ -576,7 +604,21 @@ void runStratumWorker(void *name) {
         s_submition_map.insert(std::make_pair(sumbit_id, submition));
         if (s_submition_map.size() > 32)
           s_submition_map.erase(s_submition_map.begin());
+
+        shouldYield = true;
       }
+    }
+
+    if (activeLoop) {
+      perfCtrlActiveLoops++;
+    } else {
+      perfCtrlIdleLoops++;
+    }
+
+    if (shouldYield)
+    {
+      perfCtrlYields++;
+      vTaskDelay(1 / portTICK_PERIOD_MS);
     }
   }
 }
@@ -638,7 +680,7 @@ void minerWorkerSw(void * task_id)
         }
       }
     } else
-      vTaskDelay(2 / portTICK_PERIOD_MS);
+      vTaskDelay(MINER_WORKER_EMPTY_DELAY_MS / portTICK_PERIOD_MS);
 
     wdt_counter++;
     if (wdt_counter >= 8)
@@ -887,7 +929,7 @@ void minerWorkerHw(void * task_id)
       }
       esp_sha_release_hardware();
     } else
-      vTaskDelay(2 / portTICK_PERIOD_MS);
+      vTaskDelay(MINER_WORKER_EMPTY_DELAY_MS / portTICK_PERIOD_MS);
 
     wdt_counter++;
     if (wdt_counter >= 8)
@@ -1115,7 +1157,7 @@ void minerWorkerHw(void * task_id)
       }
       esp_sha_unlock_engine(SHA2_256);
     } else
-      vTaskDelay(2 / portTICK_PERIOD_MS);
+      vTaskDelay(MINER_WORKER_EMPTY_DELAY_MS / portTICK_PERIOD_MS);
 
     esp_task_wdt_reset();
   }
@@ -1215,10 +1257,17 @@ void runMonitor(void *name)
   unsigned long frame = 0;
 
   uint32_t seconds_elapsed = 0;
+  uint32_t perfLogSeconds = 0;
 
   totalKHashes = (Mhashes * 1000) + hashes / 1000;
   uint32_t last_update_millis = millis();
   uint32_t uptime_frac = 0;
+  uint64_t uptime_boot_base = 0;
+  {
+    const uint64_t boot_seconds = ((uint64_t)last_update_millis) / 1000ULL;
+    if (upTime > boot_seconds)
+      uptime_boot_base = upTime - boot_seconds;
+  }
 
   while (1)
   {
@@ -1242,6 +1291,11 @@ void runMonitor(void *name)
         upTime ++;
       }
 
+      // Keep uptime monotonic even if monitor ticks jitter or are delayed.
+      const uint64_t monotonic_uptime = uptime_boot_base + (((uint64_t)now_millis) / 1000ULL);
+      if (upTime < monotonic_uptime)
+        upTime = monotonic_uptime;
+
       drawCurrentScreen(mElapsed);
 
       // Monitor state when hashrate is 0.0
@@ -1259,6 +1313,25 @@ void runMonitor(void *name)
       #endif
 
       seconds_elapsed++;
+      perfLogSeconds++;
+
+      if (perfLogSeconds >= 30)
+      {
+        perfLogSeconds = 0;
+        uint32_t active = perfCtrlActiveLoops;
+        uint32_t idle = perfCtrlIdleLoops;
+        uint32_t yields = perfCtrlYields;
+        uint32_t total = active + idle;
+        uint32_t activePct = (total > 0) ? ((active * 100U) / total) : 0;
+        Serial.printf("[PERF] ctrl active=%lu idle=%lu yields=%lu activePct=%lu%%\n",
+                      (unsigned long)active,
+                      (unsigned long)idle,
+                      (unsigned long)yields,
+                      (unsigned long)activePct);
+        perfCtrlActiveLoops = 0;
+        perfCtrlIdleLoops = 0;
+        perfCtrlYields = 0;
+      }
 
       if(seconds_elapsed % (saveIntervals[currentIntervalIndex]) == 0){
         saveStat();

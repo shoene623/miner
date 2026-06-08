@@ -612,6 +612,50 @@ static uint16_t directionColor(const String &dir) {
   return TC_NEUT;
 }
 
+static float parseSentimentScore10(const String &sentimentText) {
+  String s = sentimentText;
+  s.trim();
+  if (s.isEmpty() || s == "--") return -1.0f;
+
+  int slash = s.indexOf('/');
+  if (slash > 0) {
+    float n = s.substring(0, slash).toFloat();
+    float d = s.substring(slash + 1).toFloat();
+    if (d > 0.0f) {
+      float v = (n / d) * 10.0f;
+      if (v < 0.0f) v = 0.0f;
+      if (v > 10.0f) v = 10.0f;
+      return v;
+    }
+  }
+
+  float direct = s.toFloat();
+  if (direct >= 0.0f) {
+    if (direct > 10.0f) direct = direct / 10.0f;
+    if (direct < 0.0f) direct = 0.0f;
+    if (direct > 10.0f) direct = 10.0f;
+    return direct;
+  }
+  return -1.0f;
+}
+
+static String moodFromScore(float score10) {
+  if (score10 < 0.0f) return "?";
+  if (score10 >= 7.0f) return ":)";
+  if (score10 >= 4.0f) return ":|";
+  return ":(";
+}
+
+static String pctMoveFromSeries(const CandleSeries &series) {
+  if (series.count < 2) return "--";
+  const CandlePoint &last = series.points[series.count - 1];
+  const CandlePoint &prev = series.points[series.count - 2];
+  if (prev.close == 0.0f) return "--";
+  float pct = ((last.close - prev.close) / prev.close) * 100.0f;
+  String sign = (pct >= 0.0f) ? "+" : "";
+  return sign + String(pct, 2) + "%";
+}
+
 static bool parseDateDDMMYYYY(const String &dateStr, int &day, int &month, int &year) {
   if (dateStr.length() < 10) return false;
   day = dateStr.substring(0, 2).toInt();
@@ -968,10 +1012,17 @@ static void drawTickerRecommendationTab(const TickerData &data) {
   drawWrapped(data.recommendation.isEmpty() ? "No data" : data.recommendation,
               13, 77, 294, 3, 1, TFT_WHITE, TC_CARD);
 
+  const String btcLive = data.btcCandles.price.isEmpty() ? "--" : data.btcCandles.price;
+  const String xrpLive = data.xrpCandles.price.isEmpty() ? "--" : data.xrpCandles.price;
+  const String btcMove = pctMoveFromSeries(data.btcCandles);
+  const String xrpMove = pctMoveFromSeries(data.xrpCandles);
+
   const String btcLine = "BTC " + (data.btcDirection.isEmpty() ? "--" : data.btcDirection)
+                       + " P:" + btcLive + " " + btcMove
                        + " E:" + (data.btcEntry.isEmpty() ? "--" : data.btcEntry)
                        + " TP:" + (data.btcTakeProfit.isEmpty() ? "--" : data.btcTakeProfit);
   const String xrpLine = "XRP " + (data.xrpDirection.isEmpty() ? "--" : data.xrpDirection)
+                       + " P:" + xrpLive + " " + xrpMove
                        + " E:" + (data.xrpEntry.isEmpty() ? "--" : data.xrpEntry)
                        + " TP:" + (data.xrpTakeProfit.isEmpty() ? "--" : data.xrpTakeProfit);
   tft.setTextColor(directionColor(data.btcDirection), TC_CARD);
@@ -1047,6 +1098,25 @@ void drawTickerPage(unsigned long mElapsed) {
   const String score = data.sentiment.isEmpty() ? "--" : data.sentiment;
   tft.setTextColor(TFT_WHITE, TC_BG);
   tft.drawString(score, 10, 16, 4);
+
+  const float score10 = parseSentimentScore10(score);
+  const String mood = moodFromScore(score10);
+  tft.setTextColor(TC_ACCENT, TC_BG);
+  tft.drawString(mood, 255, 18, 4);
+
+  // Compact score bar gives the page more motion/feel even on partial text payloads.
+  const int barX = 10;
+  const int barY = 45;
+  const int barW = 140;
+  const int barH = 6;
+  tft.drawRect(barX, barY, barW, barH, TC_BORDER);
+  if (score10 >= 0.0f) {
+    int fill = (int)((score10 / 10.0f) * (barW - 2));
+    if (fill < 0) fill = 0;
+    if (fill > (barW - 2)) fill = barW - 2;
+    uint16_t col = (score10 >= 7.0f) ? TC_BULL : ((score10 >= 4.0f) ? TC_NEUT : TC_BEAR);
+    tft.fillRect(barX + 1, barY + 1, fill, barH - 2, col);
+  }
 
   // Direction badge (color-coded) next to score
   const int scoreW = tft.textWidth(score, 4);
