@@ -24,6 +24,7 @@
 #define DEFAULT_THEME_MODE	0
 #define DEFAULT_FLIPSCREEN	false
 #define DEFAULT_AUTOSCREENROTATION	false
+#define DEFAULT_SCROLL_INT	10
 
 // JSON config files
 #define JSON_CONFIG_FILE	"/config.json"
@@ -43,6 +44,7 @@
 #define JSON_KEY_THEME		"themeMode"
 #define JSON_KEY_FLIPSCREEN	"flipScreen"
 #define JSON_KEY_AUTOSCREENROTATION	"autoScreenRotation"
+#define JSON_KEY_SCROLL_INT	"ScrollInterval"
 
 // JSON config file SPIFFS (different for backward compatibility with existing devices)
 #define JSON_SPIFFS_KEY_POOLURL		"poolString"
@@ -57,6 +59,7 @@
 #define JSON_SPIFFS_KEY_THEME	"themeMode"
 #define JSON_SPIFFS_KEY_FLIPSCREEN	"flipScreen"
 #define JSON_SPIFFS_KEY_AUTOSCREENROTATION	"autoScreenRotation"
+#define JSON_SPIFFS_KEY_SCROLL_INT	"autoScrollInterval"
 
 // settings
 struct TSettings
@@ -75,6 +78,7 @@ struct TSettings
 	int themeMode{ DEFAULT_THEME_MODE };
 	bool flipScreen{ DEFAULT_FLIPSCREEN };
 	bool autoScreenRotation{ DEFAULT_AUTOSCREENROTATION };
+	int autoScrollInterval{ DEFAULT_SCROLL_INT };
 };
 
 #endif // _STORAGE_H_

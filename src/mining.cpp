@@ -619,6 +619,8 @@ void runStratumWorker(void *name) {
     {
       perfCtrlYields++;
       vTaskDelay(1 / portTICK_PERIOD_MS);
+    } else if (activeLoop) {
+      vTaskDelay(MINER_CTRL_DELAY_ACTIVE_MS / portTICK_PERIOD_MS);
     }
   }
 }
@@ -1251,6 +1253,7 @@ void runMonitor(void *name)
   restoreStat();
 
   unsigned long mLastCheck = 0;
+  int lastDrawnScreen = -1;
 
   resetToFirstScreen();
 
@@ -1275,28 +1278,39 @@ void runMonitor(void *name)
     if (now_millis < last_update_millis)
       now_millis = last_update_millis;
     
+    bool screenChanged = false;
+    if (currentDisplayDriver && currentDisplayDriver->current_cyclic_screen != lastDrawnScreen) {
+      screenChanged = true;
+    }
+
     uint32_t mElapsed = now_millis - mLastCheck;
-    if (mElapsed >= 1000)
+    if (mElapsed >= 1000 || screenChanged)
     { 
       mLastCheck = now_millis;
-      last_update_millis = now_millis;
-      unsigned long currentKHashes = (Mhashes * 1000) + hashes / 1000;
-      elapsedKHs = currentKHashes - totalKHashes;
-      totalKHashes = currentKHashes;
+      if (currentDisplayDriver) {
+        lastDrawnScreen = currentDisplayDriver->current_cyclic_screen;
+      }
+      
+      if (!screenChanged) {
+        last_update_millis = now_millis;
+        unsigned long currentKHashes = (Mhashes * 1000) + hashes / 1000;
+        elapsedKHs = currentKHashes - totalKHashes;
+        totalKHashes = currentKHashes;
 
-      uptime_frac += mElapsed;
-      while (uptime_frac >= 1000)
-      {
-        uptime_frac -= 1000;
-        upTime ++;
+        uptime_frac += mElapsed;
+        while (uptime_frac >= 1000)
+        {
+          uptime_frac -= 1000;
+          upTime ++;
+        }
+
+        // Keep uptime monotonic even if monitor ticks jitter or are delayed.
+        const uint64_t monotonic_uptime = uptime_boot_base + (((uint64_t)now_millis) / 1000ULL);
+        if (upTime < monotonic_uptime)
+          upTime = monotonic_uptime;
       }
 
-      // Keep uptime monotonic even if monitor ticks jitter or are delayed.
-      const uint64_t monotonic_uptime = uptime_boot_base + (((uint64_t)now_millis) / 1000ULL);
-      if (upTime < monotonic_uptime)
-        upTime = monotonic_uptime;
-
-      drawCurrentScreen(mElapsed);
+      drawCurrentScreen(screenChanged ? 0 : mElapsed);
 
       // Monitor state when hashrate is 0.0
       if (elapsedKHs == 0)

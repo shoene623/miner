@@ -41,6 +41,7 @@ bool nvMemory::saveConfig(TSettings* Settings)
         json[JSON_SPIFFS_KEY_THEME] = Settings->themeMode;
         json[JSON_SPIFFS_KEY_FLIPSCREEN] = Settings->flipScreen;
         json[JSON_SPIFFS_KEY_AUTOSCREENROTATION] = Settings->autoScreenRotation;
+        json[JSON_SPIFFS_KEY_SCROLL_INT] = Settings->autoScrollInterval;
 
         // Open config file
         File configFile = SPIFFS.open(JSON_CONFIG_FILE, "w");
@@ -95,8 +96,15 @@ bool nvMemory::loadConfig(TSettings* Settings)
                 if (!error)
                 {
                     Settings->PoolAddress = json[JSON_SPIFFS_KEY_POOLURL] | Settings->PoolAddress;
-                    strcpy(Settings->PoolPassword, json[JSON_SPIFFS_KEY_POOLPASS] | Settings->PoolPassword);
-                    strcpy(Settings->BtcWallet, json[JSON_SPIFFS_KEY_WALLETID] | Settings->BtcWallet);
+                    if (Settings->PoolAddress.length() > 79) {
+                        Settings->PoolAddress = Settings->PoolAddress.substring(0, 79);
+                    }
+                    const char* poolPassVal = json[JSON_SPIFFS_KEY_POOLPASS] | Settings->PoolPassword;
+                    strncpy(Settings->PoolPassword, poolPassVal, sizeof(Settings->PoolPassword) - 1);
+                    Settings->PoolPassword[sizeof(Settings->PoolPassword) - 1] = '\0';
+                    const char* btcWalletVal = json[JSON_SPIFFS_KEY_WALLETID] | Settings->BtcWallet;
+                    strncpy(Settings->BtcWallet, btcWalletVal, sizeof(Settings->BtcWallet) - 1);
+                    Settings->BtcWallet[sizeof(Settings->BtcWallet) - 1] = '\0';
                     if (json.containsKey(JSON_SPIFFS_KEY_POOLPORT))
                         Settings->PoolPort = json[JSON_SPIFFS_KEY_POOLPORT].as<int>();
                     if (json.containsKey(JSON_SPIFFS_KEY_TIMEZONE))
@@ -132,6 +140,11 @@ bool nvMemory::loadConfig(TSettings* Settings)
                         Settings->autoScreenRotation = json[JSON_SPIFFS_KEY_AUTOSCREENROTATION].as<bool>();
                     } else {
                         Settings->autoScreenRotation = false;
+                    }
+                    if (json.containsKey(JSON_SPIFFS_KEY_SCROLL_INT)) {
+                        Settings->autoScrollInterval = json[JSON_SPIFFS_KEY_SCROLL_INT].as<int>();
+                    } else {
+                        Settings->autoScrollInterval = DEFAULT_SCROLL_INT;
                     }
                     return true;
                 }

@@ -41,7 +41,7 @@ unsigned long displayModeLastFlipMs = 0;
 const unsigned long DISPLAY_MODE_FLIP_INTERVAL_MS = 10000;
 
 const char* TICKER_API_URL = "https://seans-forcasting.vercel.app/api/ticker";
-const unsigned long TICKER_REFRESH_INTERVAL_MS = 15000;
+const unsigned long TICKER_REFRESH_INTERVAL_MS = 300000; // 5 minutes
 
 SemaphoreHandle_t tickerDataMutex = nullptr;
 volatile bool tickerFetchInProgress = false;
@@ -105,9 +105,12 @@ void storeTickerCache(const TickerData &src) {
 }
 
 bool parseTickerJson(const String &payload, TickerData &outData) {
+  Serial.printf("[DEBUG] parseTickerJson: payload length = %u, free heap = %u\n", payload.length(), ESP.getFreeHeap());
   DynamicJsonDocument doc(6144);
+  Serial.printf("[DEBUG] parseTickerJson: allocated doc capacity = %u, free heap = %u\n", doc.capacity(), ESP.getFreeHeap());
   DeserializationError err = deserializeJson(doc, payload);
   if (err) {
+    Serial.printf("[ERROR] parseTickerJson: JSON parse failed: %s\n", err.c_str());
     outData.status = "JSON parse failed";
     return false;
   }
@@ -151,35 +154,48 @@ bool parseTickerJson(const String &payload, TickerData &outData) {
 }
 
 void tickerFetchTask(void *param) {
+  Serial.printf("[DEBUG] tickerFetchTask: Task started. Free stack watermark: %u, Free heap: %u\n",
+                uxTaskGetStackHighWaterMark(NULL), ESP.getFreeHeap());
   TickerData newData;
   copyTickerCache(newData);
 
   if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WARNING] tickerFetchTask: WiFi disconnected, aborting fetch");
     newData.status = "WiFi disconnected";
     storeTickerCache(newData);
     tickerFetchInProgress = false;
+    Serial.println("[DEBUG] tickerFetchTask: Deleting task");
     vTaskDelete(nullptr);
     return;
   }
 
+  Serial.printf("[DEBUG] tickerFetchTask: Connecting to %s. Free heap: %u\n", TICKER_API_URL, ESP.getFreeHeap());
   HTTPClient http;
-  http.setTimeout(2500);
+  http.setTimeout(10000);
   bool ok = false;
+  static WiFiClientSecure secureClient;
+  secureClient.setHandshakeTimeout(10);
 
-  if (http.begin(TICKER_API_URL)) {
+  secureClient.setInsecure();
+  if (http.begin(secureClient, TICKER_API_URL)) {
+    Serial.println("[DEBUG] tickerFetchTask: Sending GET request...");
     const int httpCode = http.GET();
+    Serial.printf("[DEBUG] tickerFetchTask: GET response code: %d. Free heap: %u\n", httpCode, ESP.getFreeHeap());
     if (httpCode == HTTP_CODE_OK) {
       String payload = http.getString();
+      Serial.printf("[DEBUG] tickerFetchTask: Read payload (length = %u)\n", payload.length());
       ok = parseTickerJson(payload, newData);
       if (!ok && payload.length() > 0) {
         newData.status = "Unexpected JSON shape";
       }
     } else {
       newData.status = String("HTTP ") + String(httpCode);
+      Serial.printf("[ERROR] tickerFetchTask: GET request failed: %s\n", newData.status.c_str());
     }
     http.end();
   } else {
     newData.status = "HTTP begin failed";
+    Serial.println("[ERROR] tickerFetchTask: HTTP begin failed");
   }
 
   if (ok) {
@@ -189,8 +205,11 @@ void tickerFetchTask(void *param) {
     Serial.printf("[TICKER] Update failed: %s\n", newData.status.c_str());
   }
 
+  Serial.println("[DEBUG] tickerFetchTask: Storing new data to cache");
   storeTickerCache(newData);
   tickerFetchInProgress = false;
+  Serial.printf("[DEBUG] tickerFetchTask: Task complete. Free stack watermark: %u, Free heap: %u. Deleting task\n",
+                uxTaskGetStackHighWaterMark(NULL), ESP.getFreeHeap());
   vTaskDelete(nullptr);
 }
 
@@ -207,6 +226,7 @@ void maybeStartTickerFetch() {
   tickerLastFetchAttemptMs = now;
   tickerFetchInProgress = true;
 
+  Serial.println("[DEBUG] maybeStartTickerFetch: Spawning TickerFetch task with 6KB stack");
   BaseType_t created = xTaskCreatePinnedToCore(
       tickerFetchTask,
       "TickerFetch",
@@ -217,6 +237,7 @@ void maybeStartTickerFetch() {
       1);
 
   if (created != pdPASS) {
+    Serial.println("[ERROR] maybeStartTickerFetch: Failed to create TickerFetch task!");
     tickerFetchInProgress = false;
   }
 }

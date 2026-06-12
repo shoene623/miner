@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include "mbedtls/md.h"
 #include "HTTPClient.h"
 #include <NTPClient.h>
@@ -35,8 +36,331 @@ unsigned int bitcoin_price=0;
 String current_block = "793261";
 global_data gData;
 pool_data pData;
+unsigned long mGlobalUpdate = 0;
+unsigned long mHeightUpdate = 0;
+unsigned long mBTCUpdate = 0;
+unsigned long mPoolUpdate = 0;
 String poolAPIUrl;
+volatile bool networkFetchInProgress = false;
 
+SemaphoreHandle_t monitorDataMutex = nullptr;
+static volatile bool monitorFetchInProgress = false;
+
+void lockMonitorData() {
+    if (monitorDataMutex != nullptr) {
+        xSemaphoreTake(monitorDataMutex, portMAX_DELAY);
+    }
+}
+
+void unlockMonitorData() {
+    if (monitorDataMutex != nullptr) {
+        xSemaphoreGive(monitorDataMutex);
+    }
+}
+
+void runUpdateGlobalData(void){
+    mGlobalUpdate = millis(); // Set early to prevent spamming if request fails/blocks
+    if (WiFi.status() != WL_CONNECTED) {
+        return;
+    }
+        
+    //Make first API call to get global hash and current difficulty
+    HTTPClient http;
+    http.setTimeout(8000);
+    try {
+    String url1 = String(getGlobalHash);
+    http.begin(url1);
+    http.addHeader("User-Agent", "NerdMinerV2-Monitor/1.0");
+    http.addHeader("Accept", "application/json");
+    int httpCode = http.GET();
+
+    if (httpCode == HTTP_CODE_OK) {
+        String payload = http.getString();
+        
+        DynamicJsonDocument doc(1024);
+        deserializeJson(doc, payload);
+        String temp = "";
+        String globalHashVal = "";
+        String difficultyVal = "";
+        if (doc.containsKey("currentHashrate")) temp = String(doc["currentHashrate"].as<float>());
+        if(temp.length()>18 + 3) //Exahashes more than 18 digits + 3 digits decimals
+          globalHashVal = temp.substring(0,temp.length()-18 - 3);
+        if (doc.containsKey("currentDifficulty")) temp = String(doc["currentDifficulty"].as<float>());
+        if(temp.length()>10 + 3){ //Terahash more than 10 digits + 3 digit decimals
+          temp = temp.substring(0,temp.length()-10 - 3);
+          difficultyVal = temp.substring(0,temp.length()-2) + "." + temp.substring(temp.length()-2,temp.length()) + "T";
+        }
+        doc.clear();
+
+        lockMonitorData();
+        if (!globalHashVal.isEmpty()) gData.globalHash = globalHashVal;
+        if (!difficultyVal.isEmpty()) gData.difficulty = difficultyVal;
+        unlockMonitorData();
+
+        mGlobalUpdate = millis();
+    }
+    http.end();
+
+    //Make third API call to get fees
+    String url2 = String(getFees);
+    http.begin(url2);
+    http.addHeader("User-Agent", "NerdMinerV2-Monitor/1.0");
+    http.addHeader("Accept", "application/json");
+    int httpCode2 = http.GET();
+
+    if (httpCode2 == HTTP_CODE_OK) {
+        String payload = http.getString();
+        
+        DynamicJsonDocument doc(1024);
+        deserializeJson(doc, payload);
+        int halfHourFee = 0;
+#ifdef SCREEN_FEES_ENABLE
+        int fastestFee = 0;
+        int hourFee = 0;
+        int economyFee = 0;
+        int minimumFee = 0;
+#endif
+        if (doc.containsKey("halfHourFee")) halfHourFee = doc["halfHourFee"].as<int>();
+#ifdef SCREEN_FEES_ENABLE
+        if (doc.containsKey("fastestFee"))  fastestFee = doc["fastestFee"].as<int>();
+        if (doc.containsKey("hourFee"))     hourFee = doc["hourFee"].as<int>();
+        if (doc.containsKey("economyFee"))  economyFee = doc["economyFee"].as<int>();
+        if (doc.containsKey("minimumFee"))  minimumFee = doc["minimumFee"].as<int>();
+#endif
+        doc.clear();
+
+        lockMonitorData();
+        if (halfHourFee != 0) gData.halfHourFee = halfHourFee;
+#ifdef SCREEN_FEES_ENABLE
+        if (fastestFee != 0) gData.fastestFee = fastestFee;
+        if (hourFee != 0) gData.hourFee = hourFee;
+        if (economyFee != 0) gData.economyFee = economyFee;
+        if (minimumFee != 0) gData.minimumFee = minimumFee;
+#endif
+        unlockMonitorData();
+
+        mGlobalUpdate = millis();
+    }
+    
+    http.end();
+    } catch(...) {
+      Serial.println("Global data HTTP error caught");
+      http.end();
+    }
+}
+
+void runUpdateBlockHeight(void) {
+    mHeightUpdate = millis(); // Set early to prevent spamming if request fails/blocks
+    if (WiFi.status() != WL_CONNECTED) {
+        return;
+    }
+        
+    HTTPClient http;
+    http.setTimeout(8000);
+    try {
+    String url = String(getHeightAPI);
+    http.begin(url);
+    http.addHeader("User-Agent", "NerdMinerV2-Monitor/1.0");
+    http.addHeader("Accept", "application/json");
+    int httpCode = http.GET();
+
+    if (httpCode == HTTP_CODE_OK) {
+        String payload = http.getString();
+        payload.trim();
+
+        lockMonitorData();
+        current_block = payload;
+        unlockMonitorData();
+
+        mHeightUpdate = millis();
+    }        
+    http.end();
+    } catch(...) {
+      Serial.println("Height HTTP error caught");
+      http.end();
+    }
+}
+
+void runUpdateBTCprice(void) {
+    mBTCUpdate = millis(); // Set early to prevent spamming if request fails/blocks
+    if (WiFi.status() != WL_CONNECTED) {
+        return;
+    }
+    
+    HTTPClient http;
+    http.setTimeout(8000);
+
+    try {
+    String url = String(getBTCAPI);
+    http.begin(url);
+    http.addHeader("User-Agent", "NerdMinerV2-Monitor/1.0");
+    http.addHeader("Accept", "application/json");
+    int httpCode = http.GET();
+
+    if (httpCode == HTTP_CODE_OK) {
+        String payload = http.getString();
+
+        DynamicJsonDocument doc(1024);
+        deserializeJson(doc, payload);
+      
+        if (doc.containsKey("bitcoin") && doc["bitcoin"].containsKey("usd")) {
+            unsigned int price = doc["bitcoin"]["usd"];
+            lockMonitorData();
+            bitcoin_price = price;
+            unlockMonitorData();
+        }
+
+        doc.clear();
+
+        mBTCUpdate = millis();
+    }
+    
+    http.end();
+    } catch(...) {
+      Serial.println("BTC price HTTP error caught");
+      http.end();
+    }
+}
+
+void runUpdatePoolData(void) {
+    mPoolUpdate = millis(); // Set early to prevent spamming if request fails/blocks
+    if (WiFi.status() != WL_CONNECTED) return;
+    
+    HTTPClient http;
+    http.setTimeout(8000);        
+    try {          
+      String btcWallet = Settings.BtcWallet;
+      if (btcWallet.indexOf(".")>0) btcWallet = btcWallet.substring(0,btcWallet.indexOf("."));
+      String url;
+#ifdef SCREEN_WORKERS_ENABLE
+      Serial.println("Pool API : " + poolAPIUrl+btcWallet);
+      url = poolAPIUrl+btcWallet;
+#else
+      url = String(getPublicPool)+btcWallet;
+#endif
+
+      http.begin(url);
+      http.addHeader("User-Agent", "NerdMinerV2-Monitor/1.0");
+      http.addHeader("Accept", "application/json");
+      int httpCode = http.GET();
+      if (httpCode == HTTP_CODE_OK) {
+          String payload = http.getString();
+          DynamicJsonDocument filter(300);
+          filter["bestDifficulty"] = true;
+          filter["workersCount"] = true;
+          filter["workers"][0]["sessionId"] = true;
+          filter["workers"][0]["hashRate"] = true;
+          DynamicJsonDocument doc(2048);
+          deserializeJson(doc, payload, DeserializationOption::Filter(filter));
+          
+          int workersCount = 0;
+          String workersHash = "0";
+          String bestDifficulty = "0";
+          
+          if (doc.containsKey("workersCount")) workersCount = doc["workersCount"].as<int>();
+          if (doc.containsKey("workers") && doc["workers"].is<JsonArray>()) {
+              const JsonArray workers = doc["workers"].as<JsonArray>();
+              float totalhashs = 0;
+              for (const JsonObject worker : workers) {
+                  totalhashs += worker["hashRate"].as<double>();
+              }
+              char totalhashs_s[16] = {0};
+              suffix_string(totalhashs, totalhashs_s, 16, 0);
+              workersHash = String(totalhashs_s);
+          } else {
+              workersHash = "0";
+          }
+
+          double temp;
+          if (doc.containsKey("bestDifficulty")) {
+              temp = doc["bestDifficulty"].as<double>();            
+              char best_diff_string[16] = {0};
+              suffix_string(temp, best_diff_string, 16, 0);
+              bestDifficulty = String(best_diff_string);
+          }
+          doc.clear();
+          
+          lockMonitorData();
+          pData.workersCount = workersCount;
+          pData.workersHash = workersHash;
+          pData.bestDifficulty = bestDifficulty;
+          unlockMonitorData();
+          
+          mPoolUpdate = millis();
+          Serial.println("\n####### Pool Data OK!");               
+      } else {
+          Serial.println("\n####### Pool Data HTTP Error!");    
+          lockMonitorData();
+          pData.bestDifficulty = "P";
+          pData.workersHash = "E";
+          pData.workersCount = 0;
+          unlockMonitorData();
+      }
+      http.end();
+    } catch(...) {
+      Serial.println("####### Pool Error!");          
+      lockMonitorData();
+      pData.bestDifficulty = "P";
+      pData.workersHash = "Error";
+      pData.workersCount = 0;
+      unlockMonitorData();
+      http.end();
+    } 
+}
+
+void monitorFetchTask(void *param) {
+    const unsigned long now = millis();
+    
+    // Check global due
+    if ((mGlobalUpdate == 0) || (now - mGlobalUpdate > UPDATE_Global_min * 60 * 1000)) {
+       runUpdateGlobalData();
+    }
+    
+    // Check height due
+    if ((mHeightUpdate == 0) || (now - mHeightUpdate > UPDATE_Height_min * 60 * 1000)) {
+       runUpdateBlockHeight();
+    }
+    
+    // Check BTC due
+    if ((mBTCUpdate == 0) || (now - mBTCUpdate > UPDATE_BTC_min * 60 * 1000)) {
+       runUpdateBTCprice();
+    }
+    
+    // Check pool due
+    if ((mPoolUpdate == 0) || (now - mPoolUpdate > UPDATE_POOL_min * 60 * 1000)) {
+       runUpdatePoolData();
+    }
+    
+    monitorFetchInProgress = false;
+    networkFetchInProgress = false;
+    vTaskDelete(nullptr);
+}
+
+void maybeStartMonitorFetch() {
+    if (monitorFetchInProgress || networkFetchInProgress) {
+        return;
+    }
+    
+    if (WiFi.status() != WL_CONNECTED) {
+        return;
+    }
+    
+    const unsigned long now = millis();
+    bool globalDue = (mGlobalUpdate == 0) || (now - mGlobalUpdate > UPDATE_Global_min * 60 * 1000);
+    bool heightDue = (mHeightUpdate == 0) || (now - mHeightUpdate > UPDATE_Height_min * 60 * 1000);
+    bool btcDue = (mBTCUpdate == 0) || (now - mBTCUpdate > UPDATE_BTC_min * 60 * 1000);
+    bool poolDue = (mPoolUpdate == 0) || (now - mPoolUpdate > UPDATE_POOL_min * 60 * 1000);
+    
+    if (globalDue || heightDue || btcDue || poolDue) {
+        monitorFetchInProgress = true;
+        networkFetchInProgress = true;
+        BaseType_t created = xTaskCreatePinnedToCore(monitorFetchTask, "MonitorFetch", 8192, nullptr, 1, nullptr, 1);
+        if (created != pdPASS) {
+            monitorFetchInProgress = false;
+            networkFetchInProgress = false;
+        }
+    }
+}
 
 void setup_monitor(void){
     /******** TIME ZONE SETTING *****/
@@ -52,157 +376,49 @@ void setup_monitor(void){
     poolAPIUrl = getPoolAPIUrl();
     Serial.println("poolAPIUrl: " + poolAPIUrl);
 #endif
+
+    if (monitorDataMutex == nullptr) {
+        monitorDataMutex = xSemaphoreCreateMutex();
+    }
+
+    // Delay the initial API requests to prevent blocking boot/UI tasks
+    mGlobalUpdate = millis() - (UPDATE_Global_min * 60 * 1000) + 15 * 1000;  // 15 seconds delay
+    mHeightUpdate = millis() - (UPDATE_Height_min * 60 * 1000) + 30 * 1000;  // 30 seconds delay
+    mBTCUpdate = millis() - (UPDATE_BTC_min * 60 * 1000) + 45 * 1000;        // 45 seconds delay
+    mPoolUpdate = millis() - (UPDATE_POOL_min * 60 * 1000) + 60 * 1000;      // 60 seconds delay
 }
 
-unsigned long mGlobalUpdate =0;
 
 void updateGlobalData(void){
-    
-    if((mGlobalUpdate == 0) || (millis() - mGlobalUpdate > UPDATE_Global_min * 60 * 1000)){
-    
-        if (WiFi.status() != WL_CONNECTED) return;
-            
-        //Make first API call to get global hash and current difficulty
-        HTTPClient http;
-        http.setTimeout(10000);
-        try {
-        http.begin(getGlobalHash);
-        int httpCode = http.GET();
-
-        if (httpCode == HTTP_CODE_OK) {
-            String payload = http.getString();
-            
-            StaticJsonDocument<1024> doc;
-            deserializeJson(doc, payload);
-            String temp = "";
-            if (doc.containsKey("currentHashrate")) temp = String(doc["currentHashrate"].as<float>());
-            if(temp.length()>18 + 3) //Exahashes more than 18 digits + 3 digits decimals
-              gData.globalHash = temp.substring(0,temp.length()-18 - 3);
-            if (doc.containsKey("currentDifficulty")) temp = String(doc["currentDifficulty"].as<float>());
-            if(temp.length()>10 + 3){ //Terahash more than 10 digits + 3 digit decimals
-              temp = temp.substring(0,temp.length()-10 - 3);
-              gData.difficulty = temp.substring(0,temp.length()-2) + "." + temp.substring(temp.length()-2,temp.length()) + "T";
-            }
-            doc.clear();
-
-            mGlobalUpdate = millis();
-        }
-        http.end();
-
-      
-        //Make third API call to get fees
-        http.begin(getFees);
-        httpCode = http.GET();
-
-        if (httpCode == HTTP_CODE_OK) {
-            String payload = http.getString();
-            
-            StaticJsonDocument<1024> doc;
-            deserializeJson(doc, payload);
-            String temp = "";
-            if (doc.containsKey("halfHourFee")) gData.halfHourFee = doc["halfHourFee"].as<int>();
-#ifdef SCREEN_FEES_ENABLE
-            if (doc.containsKey("fastestFee"))  gData.fastestFee = doc["fastestFee"].as<int>();
-            if (doc.containsKey("hourFee"))     gData.hourFee = doc["hourFee"].as<int>();
-            if (doc.containsKey("economyFee"))  gData.economyFee = doc["economyFee"].as<int>();
-            if (doc.containsKey("minimumFee"))  gData.minimumFee = doc["minimumFee"].as<int>();
-#endif
-            doc.clear();
-
-            mGlobalUpdate = millis();
-        }
-        
-        http.end();
-        } catch(...) {
-          Serial.println("Global data HTTP error caught");
-          http.end();
-        }
-    }
+    maybeStartMonitorFetch();
 }
 
-unsigned long mHeightUpdate = 0;
 
 String getBlockHeight(void){
-    
-    if((mHeightUpdate == 0) || (millis() - mHeightUpdate > UPDATE_Height_min * 60 * 1000)){
-    
-        if (WiFi.status() != WL_CONNECTED) return current_block;
-            
-        HTTPClient http;
-        http.setTimeout(10000);
-        try {
-        http.begin(getHeightAPI);
-        int httpCode = http.GET();
-
-        if (httpCode == HTTP_CODE_OK) {
-            String payload = http.getString();
-            payload.trim();
-
-            current_block = payload;
-
-            mHeightUpdate = millis();
-        }        
-        http.end();
-        } catch(...) {
-          Serial.println("Height HTTP error caught");
-          http.end();
-        }
-    }
-  
-  return current_block;
+    maybeStartMonitorFetch();
+    String height;
+    lockMonitorData();
+    height = current_block;
+    unlockMonitorData();
+    return height;
 }
 
-unsigned long mBTCUpdate = 0;
 
 String getBTCprice(void){
+    maybeStartMonitorFetch();
+    unsigned int price;
+    lockMonitorData();
+    price = bitcoin_price;
+    unlockMonitorData();
     
-    if((mBTCUpdate == 0) || (millis() - mBTCUpdate > UPDATE_BTC_min * 60 * 1000)){
-    
-        if (WiFi.status() != WL_CONNECTED) {
-            static char price_buffer[16];
-            snprintf(price_buffer, sizeof(price_buffer), "$%u", bitcoin_price);
-            return String(price_buffer);
-        }
-        
-        HTTPClient http;
-        http.setTimeout(10000);
-        bool priceUpdated = false;
-
-        try {
-        http.begin(getBTCAPI);
-        int httpCode = http.GET();
-
-        if (httpCode == HTTP_CODE_OK) {
-            String payload = http.getString();
-
-            StaticJsonDocument<1024> doc;
-            deserializeJson(doc, payload);
-          
-            if (doc.containsKey("bitcoin") && doc["bitcoin"].containsKey("usd")) {
-                bitcoin_price = doc["bitcoin"]["usd"];
-            }
-
-            doc.clear();
-
-            mBTCUpdate = millis();
-        }
-        
-        http.end();
-        } catch(...) {
-          Serial.println("BTC price HTTP error caught");
-          http.end();
-        }
-    }  
-  
-  static char price_buffer[16];
-  snprintf(price_buffer, sizeof(price_buffer), "$%u", bitcoin_price);
-  return String(price_buffer);
+    static char price_buffer[16];
+    snprintf(price_buffer, sizeof(price_buffer), "$%u", price);
+    return String(price_buffer);
 }
 
 unsigned long mTriggerUpdate = 0;
 unsigned long initialMillis = millis();
 unsigned long initialTime = 0;
-unsigned long mPoolUpdate = 0;
 
 void getTime(unsigned long* currentHours, unsigned long* currentMinutes, unsigned long* currentSeconds){
   
@@ -351,15 +567,23 @@ mining_data getMiningData(unsigned long mElapsed)
 
 clock_data getClockData(unsigned long mElapsed)
 {
+  maybeStartMonitorFetch();
+  
   clock_data data;
 
+  lockMonitorData();
   data.completedShares = shares;
   data.totalKHashes = totalKHashes;
   data.currentHashRate = getCurrentHashRate(mElapsed);
-  data.btcPrice = getBTCprice();
-  data.blockHeight = getBlockHeight();
+  
+  char price_buffer[16];
+  snprintf(price_buffer, sizeof(price_buffer), "$%u", bitcoin_price);
+  data.btcPrice = String(price_buffer);
+  
+  data.blockHeight = current_block;
   data.currentTime = getTime();
   data.currentDate = getDate();
+  unlockMonitorData();
 
   return data;
 }
@@ -377,14 +601,19 @@ clock_data_t getClockData_t(unsigned long mElapsed)
 
 coin_data getCoinData(unsigned long mElapsed)
 {
+  maybeStartMonitorFetch();
+  
   coin_data data;
-
-  updateGlobalData(); // Update gData vars asking mempool APIs
-
+  
+  lockMonitorData();
   data.completedShares = shares;
   data.totalKHashes = totalKHashes;
   data.currentHashRate = getCurrentHashRate(mElapsed);
-  data.btcPrice = getBTCprice();
+  
+  char price_buffer[16];
+  snprintf(price_buffer, sizeof(price_buffer), "$%u", bitcoin_price);
+  data.btcPrice = String(price_buffer);
+  
   data.currentTime = getTime();
 #ifdef SCREEN_FEES_ENABLE
   data.hourFee = String(gData.hourFee);
@@ -395,7 +624,8 @@ coin_data getCoinData(unsigned long mElapsed)
   data.halfHourFee = String(gData.halfHourFee) + " sat/vB";
   data.netwrokDifficulty = gData.difficulty;
   data.globalHashRate = gData.globalHash;
-  data.blockHeight = getBlockHeight();
+  data.blockHeight = current_block;
+  unlockMonitorData();
 
   unsigned long currentBlock = data.blockHeight.toInt();
   unsigned long remainingBlocks = (((currentBlock / HALVING_BLOCKS) + 1) * HALVING_BLOCKS) - currentBlock;
@@ -421,7 +651,6 @@ String getPoolAPIUrl(void) {
                         poolAPIUrl = "https://pool.sethforprivacy.com/api/client/";
                     if (Settings.PoolAddress == "pool.solomining.de")
                         poolAPIUrl = "https://pool.solomining.de/api/client/";
-                    // Add more cases for other addresses with port 3333 if needed
                     break;
                 case 2018:
                     // Local instance of public-pool.io on Umbrel or Start9
@@ -437,79 +666,10 @@ String getPoolAPIUrl(void) {
 }
 
 pool_data getPoolData(void){
-    //pool_data pData;    
-    if((mPoolUpdate == 0) || (millis() - mPoolUpdate > UPDATE_POOL_min * 60 * 1000)){      
-        if (WiFi.status() != WL_CONNECTED) return pData;            
-        //Make first API call to get global hash and current difficulty
-        HTTPClient http;
-        http.setTimeout(10000);        
-        try {          
-          String btcWallet = Settings.BtcWallet;
-          // Serial.println(btcWallet);
-          if (btcWallet.indexOf(".")>0) btcWallet = btcWallet.substring(0,btcWallet.indexOf("."));
-#ifdef SCREEN_WORKERS_ENABLE
-          Serial.println("Pool API : " + poolAPIUrl+btcWallet);
-          http.begin(poolAPIUrl+btcWallet);
-#else
-          http.begin(String(getPublicPool)+btcWallet);
-#endif
-          int httpCode = http.GET();
-          if (httpCode == HTTP_CODE_OK) {
-              String payload = http.getString();
-              // Serial.println(payload);
-              StaticJsonDocument<300> filter;
-              filter["bestDifficulty"] = true;
-              filter["workersCount"] = true;
-              filter["workers"][0]["sessionId"] = true;
-              filter["workers"][0]["hashRate"] = true;
-              StaticJsonDocument<2048> doc;
-              deserializeJson(doc, payload, DeserializationOption::Filter(filter));
-              //Serial.println(serializeJsonPretty(doc, Serial));
-              if (doc.containsKey("workersCount")) pData.workersCount = doc["workersCount"].as<int>();
-              const JsonArray& workers = doc["workers"].as<JsonArray>();
-              float totalhashs = 0;
-              for (const JsonObject& worker : workers) {
-                totalhashs += worker["hashRate"].as<double>();
-                /* Serial.print(worker["sessionId"].as<String>()+": ");
-                Serial.print(" - "+worker["hashRate"].as<String>()+": ");
-                Serial.println(totalhashs); */
-              }
-              char totalhashs_s[16] = {0};
-              suffix_string(totalhashs, totalhashs_s, 16, 0);
-              pData.workersHash = String(totalhashs_s);
-
-              double temp;
-              if (doc.containsKey("bestDifficulty")) {
-              temp = doc["bestDifficulty"].as<double>();            
-              char best_diff_string[16] = {0};
-              suffix_string(temp, best_diff_string, 16, 0);
-              pData.bestDifficulty = String(best_diff_string);
-              }
-              doc.clear();
-              mPoolUpdate = millis();
-              Serial.println("\n####### Pool Data OK!");               
-          } else {
-              Serial.println("\n####### Pool Data HTTP Error!");    
-              /* Serial.println(httpCode);
-              String payload = http.getString();
-              Serial.println(payload); */
-              // mPoolUpdate = millis();
-              pData.bestDifficulty = "P";
-              pData.workersHash = "E";
-              pData.workersCount = 0;
-              http.end();
-              return pData; 
-          }
-          http.end();
-        } catch(...) {
-          Serial.println("####### Pool Error!");          
-          // mPoolUpdate = millis();
-          pData.bestDifficulty = "P";
-          pData.workersHash = "Error";
-          pData.workersCount = 0;
-          http.end();
-          return pData;
-        } 
-    }
-    return pData;
+  maybeStartMonitorFetch();
+  pool_data data;
+  lockMonitorData();
+  data = pData;
+  unlockMonitorData();
+  return data;
 }

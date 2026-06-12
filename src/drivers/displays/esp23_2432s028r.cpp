@@ -33,21 +33,48 @@ TFT_eTouch<TFT_eSPI> touch(tft, ETOUCH_CS, 0xFF, hSPI);
 extern monitor_data mMonitor;
 extern pool_data pData;
 extern DisplayDriver *currentDisplayDriver;
+extern volatile bool networkFetchInProgress;
 extern bool invertColors; 
 extern TSettings Settings;
 bool hasChangedScreen = true;
 
-const unsigned long AUTO_SCROLL_INTERVAL_MS = 10000;
-bool autoScrollEnabled = false;
+#define AUTO_SCROLL_INTERVAL_MS ((unsigned long)(Settings.autoScrollInterval * 1000))
+bool autoScrollEnabled = true;
 unsigned long lastAutoScrollMs = 0;
 
 const int SCREEN_IDX_TICKER = 0;
 const int SCREEN_IDX_CANDLES = 1;
-const int SCREEN_IDX_SETTINGS = 2;
+const int SCREEN_IDX_SPORTS = 2;
+const int SCREEN_IDX_MINER = 3;
+const int SCREEN_IDX_SETTINGS = 4;
+
+struct SportsData {
+  String shortName = "";
+  String status = "";
+  String stlScore = "";
+  String oppScore = "";
+  String oppAbbrev = "";
+  bool isStlHome = false;
+  bool hasGame = false;
+  unsigned long lastFetchMs = 0;
+};
+
+SportsData mlbCache;
+SportsData nhlCache;
+SportsData mlsCache;
+SemaphoreHandle_t sportsDataMutex = nullptr;
+volatile bool sportsFetchInProgress = false;
+unsigned long sportsLastFetchAttemptMs = 0;
+const unsigned long SPORTS_REFRESH_INTERVAL_MS = 300000; // 5 minutes
+
+void copySportsCache(SportsData &mlbDst, SportsData &nhlDst, SportsData &mlsDst);
+void storeSportsCache(const SportsData &mlbSrc, const SportsData &nhlSrc, const SportsData &mlsSrc);
+static bool populateSportsGame(JsonObjectConst gameObj, SportsData &outData);
+
 
 const char* TICKER_API_URL = "https://seans-forcasting.vercel.app/api/ticker";
 const char* CANDLES_API_URL = "https://seans-forcasting.vercel.app/api/candles?window=2h";
-const unsigned long TICKER_REFRESH_INTERVAL_MS = 15000;
+const unsigned long TICKER_REFRESH_INTERVAL_MS = 300000; // 5 minutes
 
 SemaphoreHandle_t tickerDataMutex = nullptr;
 volatile bool tickerFetchInProgress = false;
@@ -97,6 +124,7 @@ struct TickerData {
   CandleSeries btcCandles;
   CandleSeries ethCandles;
   CandleSeries xrpCandles;
+  String greeting;
   String updated;
   String status;
 };
@@ -245,6 +273,66 @@ static bool parseCandleSeriesCompact(JsonObjectConst candlesObj, const char* key
   return true;
 }
 
+static bool parseNestedSports(JsonObjectConst rootObj) {
+  if (!rootObj.containsKey("teams") || !rootObj["teams"].is<JsonArrayConst>()) {
+    return false;
+  }
+
+  JsonArrayConst teams = rootObj["teams"].as<JsonArrayConst>();
+  SportsData newMlb;
+  SportsData newNhl;
+  SportsData newMls;
+  bool mlbFound = false;
+  bool nhlFound = false;
+  bool mlsFound = false;
+
+  for (JsonObjectConst team : teams) {
+    String league = team["k"] | "";
+    if (league == "MLB") {
+      mlbFound = true;
+      if (team.containsKey("l") && !team["l"].isNull()) {
+        populateSportsGame(team["l"].as<JsonObjectConst>(), newMlb);
+      } else if (team.containsKey("t") && !team["t"].isNull()) {
+        populateSportsGame(team["t"].as<JsonObjectConst>(), newMlb);
+      } else if (team.containsKey("y") && !team["y"].isNull()) {
+        populateSportsGame(team["y"].as<JsonObjectConst>(), newMlb);
+      } else {
+        newMlb.hasGame = false;
+      }
+    } else if (league == "NHL") {
+      nhlFound = true;
+      if (team.containsKey("l") && !team["l"].isNull()) {
+        populateSportsGame(team["l"].as<JsonObjectConst>(), newNhl);
+      } else if (team.containsKey("t") && !team["t"].isNull()) {
+        populateSportsGame(team["t"].as<JsonObjectConst>(), newNhl);
+      } else if (team.containsKey("y") && !team["y"].isNull()) {
+        populateSportsGame(team["y"].as<JsonObjectConst>(), newNhl);
+      } else {
+        newNhl.hasGame = false;
+      }
+    } else if (league == "MLS") {
+      mlsFound = true;
+      if (team.containsKey("l") && !team["l"].isNull()) {
+        populateSportsGame(team["l"].as<JsonObjectConst>(), newMls);
+      } else if (team.containsKey("t") && !team["t"].isNull()) {
+        populateSportsGame(team["t"].as<JsonObjectConst>(), newMls);
+      } else if (team.containsKey("y") && !team["y"].isNull()) {
+        populateSportsGame(team["y"].as<JsonObjectConst>(), newMls);
+      } else {
+        newMls.hasGame = false;
+      }
+    }
+  }
+
+  if (mlbFound || nhlFound || mlsFound) {
+    SportsData oldMlb, oldNhl, oldMls;
+    copySportsCache(oldMlb, oldNhl, oldMls);
+    storeSportsCache(mlbFound ? newMlb : oldMlb, nhlFound ? newNhl : oldNhl, mlsFound ? newMls : oldMls);
+    return true;
+  }
+  return false;
+}
+
 static bool parseNestedCandles(JsonObjectConst rootObj, TickerData &outData) {
   if (!rootObj.containsKey("candles")) {
     return false;
@@ -357,13 +445,18 @@ void storeTickerCache(const TickerData &src) {
 }
 
 bool parseTickerJson(const String &payload, TickerData &outData) {
+  Serial.printf("[DEBUG] parseTickerJson: payload length = %u, free heap = %u\n", payload.length(), ESP.getFreeHeap());
   // Candle payloads are much larger than sentiment payloads.
-  DynamicJsonDocument doc(32768);
+  DynamicJsonDocument doc(16384);
+  Serial.printf("[DEBUG] parseTickerJson: allocated doc capacity = %u, free heap = %u\n", doc.capacity(), ESP.getFreeHeap());
+  
   DeserializationError err = deserializeJson(doc, payload);
   if (err) {
+    Serial.printf("[ERROR] parseTickerJson: deserializeJson failed with code %s\n", err.c_str());
     outData.status = "JSON parse failed";
     return false;
   }
+  Serial.println("[DEBUG] parseTickerJson: JSON deserialized successfully");
 
   JsonVariant root = doc.as<JsonVariant>();
   JsonObject rootObj;
@@ -373,6 +466,7 @@ bool parseTickerJson(const String &payload, TickerData &outData) {
 
   // Primary path: custom sentiment API
   if (!rootObj.isNull() && (rootObj.containsKey("sentiment") || rootObj.containsKey("market_sentiment"))) {
+    outData.greeting   = rootObj["greeting"] | "";
     outData.sentiment  = rootObj["market_sentiment"] | rootObj["sentiment"] | "--";
     outData.direction  = rootObj["market_direction"] | rootObj["direction"] | "--";
     outData.category   = rootObj["category"]   | "--";
@@ -407,8 +501,9 @@ bool parseTickerJson(const String &payload, TickerData &outData) {
     // The footer will show the live device clock at render time instead.
     outData.updated = ""; // populated at display time via getClockData()
 
-    // Ticker endpoint may include nested candles payload.
+    // Ticker endpoint may include nested candles and sports payloads.
     parseNestedCandles(rootObj, outData);
+    parseNestedSports(rootObj);
 
     outData.status = "OK";
     return true;
@@ -444,15 +539,20 @@ bool parseTickerJson(const String &payload, TickerData &outData) {
 }
 
 bool fetchTickerPayload(const char* endpointUrl, String &payload, String &status) {
+  Serial.printf("[DEBUG] fetchTickerPayload: Connecting to %s. Free heap: %u\n", endpointUrl, ESP.getFreeHeap());
   HTTPClient http;
-  http.setTimeout(5000);
-  http.setConnectTimeout(5000);
+  http.setTimeout(10000);
+  http.setConnectTimeout(10000);
   http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
   http.setReuse(false);
 
   bool began = false;
   const String url = String(endpointUrl);
-  static WiFiClientSecure secureClient;
+  WiFiClientSecure secureClient;
+  secureClient.setTimeout(10000);
+  secureClient.setHandshakeTimeout(10000);
+
+
 
   if (url.startsWith("https://")) {
     secureClient.setInsecure();
@@ -462,6 +562,7 @@ bool fetchTickerPayload(const char* endpointUrl, String &payload, String &status
   }
 
   if (!began) {
+    Serial.println("[ERROR] fetchTickerPayload: HTTP begin failed");
     status = "HTTP begin failed";
     return false;
   }
@@ -469,34 +570,34 @@ bool fetchTickerPayload(const char* endpointUrl, String &payload, String &status
   http.addHeader("Accept", "application/json");
   http.addHeader("User-Agent", "NerdMinerV2-Ticker/1.0");
 
+  Serial.println("[DEBUG] fetchTickerPayload: Sending GET request...");
   int httpCode = http.GET();
-  if (httpCode <= 0) {
-    // Retry once for transient DNS/socket failures seen on ESP32.
-    delay(120);
-    httpCode = http.GET();
-  }
+
+
+  Serial.printf("[DEBUG] fetchTickerPayload: GET response code: %d. Free heap: %u\n", httpCode, ESP.getFreeHeap());
 
   if (httpCode == HTTP_CODE_OK) {
     payload = http.getString();
     http.end();
     status = "HTTP 200";
+    Serial.printf("[DEBUG] fetchTickerPayload: Successfully read payload (length = %u)\n", payload.length());
     return true;
   }
 
   status = String("HTTP ") + String(httpCode) + " " + http.errorToString(httpCode);
   http.end();
+  Serial.printf("[ERROR] fetchTickerPayload: Failed with status: %s\n", status.c_str());
   return false;
 }
 
-void tickerFetchTask(void *param) {
+void runTickerFetch() {
   TickerData newData;
   copyTickerCache(newData);
 
   if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WARNING] tickerFetchTask: WiFi disconnected, aborting fetch");
     newData.status = "WiFi disconnected";
     storeTickerCache(newData);
-    tickerFetchInProgress = false;
-    vTaskDelete(nullptr);
     return;
   }
 
@@ -508,6 +609,7 @@ void tickerFetchTask(void *param) {
   bool tickerOk = false;
   bool candleOk = false;
 
+  Serial.println("[DEBUG] tickerFetchTask: Fetching ticker payload...");
   if (fetchTickerPayload(TICKER_API_URL, tickerPayload, tickerStatus)) {
     tickerOk = parseTickerJson(tickerPayload, newData);
     ok = tickerOk || ok;
@@ -522,11 +624,13 @@ void tickerFetchTask(void *param) {
   tickerPayload = String();
 
   if (!hasCandlesFromTicker) {
+    Serial.println("[DEBUG] tickerFetchTask: Fetching candle payload...");
     if (fetchTickerPayload(CANDLES_API_URL, candlePayload, candleStatus)) {
       candleOk = parseTickerJson(candlePayload, newData);
       ok = candleOk || ok;
     }
   } else {
+    Serial.println("[DEBUG] tickerFetchTask: Ticker payload contained candle data, skipping candles fetch");
     candleOk = true;
   }
 
@@ -552,14 +656,25 @@ void tickerFetchTask(void *param) {
     Serial.printf("[TICKER] Update failed: %s\n", newData.status.c_str());
   }
 
+  Serial.println("[DEBUG] tickerFetchTask: Storing new data to cache");
   storeTickerCache(newData);
+}
+
+void tickerFetchTask(void *param) {
+  Serial.printf("[DEBUG] tickerFetchTask: Task started. Free stack watermark: %u, Free heap: %u\n",
+                uxTaskGetStackHighWaterMark(NULL), ESP.getFreeHeap());
+  networkFetchInProgress = true;
+  runTickerFetch();
   tickerFetchInProgress = false;
+  networkFetchInProgress = false;
+  Serial.printf("[DEBUG] tickerFetchTask: Task complete. Free stack watermark: %u, Free heap: %u. Deleting task\n",
+                uxTaskGetStackHighWaterMark(NULL), ESP.getFreeHeap());
   vTaskDelete(nullptr);
 }
 
 void maybeStartTickerFetch() {
   const unsigned long now = millis();
-  if (tickerFetchInProgress) {
+  if (tickerFetchInProgress || networkFetchInProgress) {
     return;
   }
 
@@ -569,8 +684,10 @@ void maybeStartTickerFetch() {
 
   tickerLastFetchAttemptMs = now;
   tickerFetchInProgress = true;
-  BaseType_t created = xTaskCreatePinnedToCore(tickerFetchTask, "TickerFetch", 12288, nullptr, 1, nullptr, 1);
+  Serial.println("[DEBUG] maybeStartTickerFetch: Spawning TickerFetch task with 6KB stack on Core 1");
+  BaseType_t created = xTaskCreatePinnedToCore(tickerFetchTask, "TickerFetch", 6144, nullptr, 1, nullptr, 1);
   if (created != pdPASS) {
+    Serial.println("[ERROR] maybeStartTickerFetch: Failed to create TickerFetch task!");
     tickerFetchInProgress = false;
   }
 }
@@ -596,7 +713,7 @@ static int tickerViewMode = 0; // 0 = sentiment, 1 = recommendation
 static unsigned long tickerViewLastSwitchMs = 0;
 
 static String tickerDataHash(const TickerData &d) {
-  return d.sentiment + d.direction
+  return d.greeting + d.sentiment + d.direction
   + d.recommendation.substring(0, 32)
        + d.daily.substring(0, 24)
        + d.weekly.substring(0, 24)
@@ -660,6 +777,14 @@ static bool parseDateDDMMYYYY(const String &dateStr, int &day, int &month, int &
   if (dateStr.length() < 10) return false;
   day = dateStr.substring(0, 2).toInt();
   month = dateStr.substring(3, 5).toInt();
+  year = dateStr.substring(6, 10).toInt();
+  return day > 0 && month > 0 && month <= 12 && year >= 1970;
+}
+
+static bool parseDateMMDDYYYY(const String &dateStr, int &month, int &day, int &year) {
+  if (dateStr.length() < 10) return false;
+  month = dateStr.substring(0, 2).toInt();
+  day = dateStr.substring(3, 5).toInt();
   year = dateStr.substring(6, 10).toInt();
   return day > 0 && month > 0 && month <= 12 && year >= 1970;
 }
@@ -788,27 +913,27 @@ static String getApiPageGreeting(const String &mmddyyyy) {
   int month = 0;
   int day = 0;
   int year = 0;
-  if (!parseDateDDMMYYYY(mmddyyyy, day, month, year)) {
-    return "Welcome Patrick";
+  if (!parseDateMMDDYYYY(mmddyyyy, month, day, year)) {
+    return "Welcome, Patrick!";
   }
 
   if (year < 2026) {
-    return "Happy Fatherday Dad!";
+    return "Happy Father's Day!";
   }
 
   if (year > 2026) {
-    return "Welcome Patrick";
+    return "Welcome, Patrick!";
   }
 
   if (month < 7) {
-    return "Happy Fatherday Dad!";
+    return "Happy Father's Day!";
   }
 
   if (month > 7) {
-    return "Welcome Patrick";
+    return "Welcome, Patrick!";
   }
 
-  return (day <= 4) ? "Happy Fatherday Dad!" : "Welcome Patrick";
+  return (day <= 3) ? "Happy Father's Day!" : "Welcome, Patrick!";
 }
 
 // Wrap text to maxLines lines each at most maxW pixels wide.
@@ -1088,7 +1213,11 @@ void drawTickerPage(unsigned long mElapsed) {
   getApiPageEasternDateTime(greetingDate, greetingTime);
 
   tft.setTextColor(TFT_PINK, TC_BG);
-  tft.drawString(getApiPageGreeting(greetingDate), 10, 5, 1);
+  String greetingText = data.greeting;
+  if (greetingText.isEmpty()) {
+    greetingText = getApiPageGreeting(greetingDate);
+  }
+  tft.drawString(greetingText, 10, 5, 1);
 
   const String marketLabel = "MARKET SENTIMENT";
   tft.setTextColor(TC_DIM, TC_BG);
@@ -1267,6 +1396,9 @@ void esp32_2432S028R_Init(void)
     tft.writecommand(ILI9341_GAMMASET); //Gamma curve selected
     tft.writedata(1); 
   }
+  #ifdef TOUCH_IRQ
+  pinMode(TOUCH_IRQ, INPUT);
+  #endif
   hSPI.begin(TOUCH_CLK, TOUCH_MISO, TOUCH_MOSI, ETOUCH_CS);
   touch.init();
 
@@ -1312,7 +1444,16 @@ void esp32_2432S028R_Init(void)
     tickerDataMutex = xSemaphoreCreateMutex();
   }
   tickerCache.status = "Waiting...";
-  autoScrollEnabled = false;
+  
+  if (sportsDataMutex == nullptr) {
+    sportsDataMutex = xSemaphoreCreateMutex();
+  }
+  mlbCache.hasGame = false;
+  nhlCache.hasGame = false;
+  sportsLastFetchAttemptMs = 0;
+  sportsFetchInProgress = false;
+
+  autoScrollEnabled = true;
   lastAutoScrollMs = millis();
   tickerLastFetchAttemptMs = 0;
   tickerFetchInProgress = false;
@@ -1345,6 +1486,12 @@ void printheap(){
   // Serial.printf("### stack WMark usage: %d\n", uxTaskGetStackHighWaterMark(NULL));
 }
 
+#define CHECK_SPRITE_CREATED(w, h) \
+  if (!createBackgroundSprite(w, h)) { \
+    Serial.printf("[WARNING] Failed to allocate background sprite of size %d x %d (heap w/ fragmentation: %u). Retrying next frame...\n", (int)(w), (int)(h), ESP.getFreeHeap()); \
+    return; \
+  }
+
 bool createBackgroundSprite(int16_t wdt, int16_t hgt){  // Set the background and link the render, used multiple times to fit in heap
   background.createSprite(wdt, hgt) ; //Background Sprite
   // printheap();
@@ -1370,8 +1517,8 @@ void printPoolData(){
           background.createSprite(320,50); //Background Sprite
           if (!background.created()) {    
             Serial.println("###### POOL SPRITE ERROR ######");
-          // Serial.printf("Pool data W:%d H:%s D:%s\n", pData.workersCount, pData.workersHash, pData.bestDifficulty);
             printheap();        
+            return;
           }       
           background.setSwapBytes(true);
           if (bottomScreenBlue) {
@@ -1400,12 +1547,12 @@ void printPoolData(){
         pData.workersCount = 1;
         tft.fillRect(0,170,320,70, TFT_DARKGREEN);        
         background.createSprite(320,40); //Background Sprite
+        if (!background.created()) {    
+          Serial.println("###### POOL SPRITE ERROR ######");
+          printheap();        
+          return;
+        }
         background.fillSprite(TFT_DARKGREEN);
-          if (!background.created()) {    
-            Serial.println("###### POOL SPRITE ERROR ######");
-          // Serial.printf("Pool data W:%d H:%s D:%s\n", pData.workersCount, pData.workersHash, pData.bestDifficulty);
-            printheap();        
-          }
         background.setFreeFont(FF24);
         background.setTextDatum(TL_DATUM);
         background.setTextSize(1);
@@ -1423,17 +1570,28 @@ void printPoolData(){
 
 void esp32_2432S028R_MinerScreen(unsigned long mElapsed)
 {
+  if (hasChangedScreen) {
+    tft.fillScreen(TFT_BLACK);
+    tft.pushImage(0, 0, initWidth, initHeight, MinerScreen);
+  }
+
+  /*
+  if (networkFetchInProgress) {
+    if (hasChangedScreen) {
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.drawString("Updating network telemetry...", 10, 180, 2);
+    }
+    return;
+  }
+  */
+
   mining_data data = getMiningData(mElapsed);
 
   printPoolData();
-
-  if (hasChangedScreen) tft.pushImage(0, 0, initWidth, initHeight, MinerScreen);
-    
-  hasChangedScreen = false; 
  
   int wdtOffset = 190;
   // Recreate sprite to the right side of the screen
-  createBackgroundSprite(WIDTH-5, HEIGHT-7);
+  CHECK_SPRITE_CREATED(WIDTH-5, HEIGHT-7);
   //Print background screen    
   background.pushImage(-190, 0, MinerWidth, MinerHeight, MinerScreen);
   
@@ -1479,7 +1637,7 @@ void esp32_2432S028R_MinerScreen(unsigned long mElapsed)
 
    //Serial.println("=========== Mining Display ==============") ;
   // Create background sprite to print data at once
-  createBackgroundSprite(WIDTH-7, HEIGHT-100); // initHeight); //Background Sprite
+  CHECK_SPRITE_CREATED(WIDTH-7, HEIGHT-100); // initHeight); //Background Sprite
   //Print background screen    
   background.pushImage(0, -90, MinerWidth, MinerHeight, MinerScreen);
 
@@ -1495,6 +1653,8 @@ void esp32_2432S028R_MinerScreen(unsigned long mElapsed)
   // Delete sprite to free the memory heap
   background.deleteSprite();  
 
+  hasChangedScreen = false;
+
   Serial.printf(">>> Completed %s share(s), %s Khashes, avg. hashrate %s KH/s\n",
                 data.completedShares.c_str(), data.totalKHashes.c_str(), data.currentHashRate.c_str()); 
    
@@ -1506,16 +1666,27 @@ void esp32_2432S028R_MinerScreen(unsigned long mElapsed)
 
 void esp32_2432S028R_ClockScreen(unsigned long mElapsed)
 {
-  if (hasChangedScreen) tft.pushImage(0, 0, minerClockWidth, minerClockHeight, minerClockScreen);
+  if (hasChangedScreen) {
+    tft.fillScreen(TFT_BLACK);
+    tft.pushImage(0, 0, minerClockWidth, minerClockHeight, minerClockScreen);
+  }
   
-  printPoolData();
+  /*
+  if (networkFetchInProgress) {
+    if (hasChangedScreen) {
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.drawString("Updating network telemetry...", 10, 180, 2);
+    }
+    return;
+  }
+  */
 
-  hasChangedScreen = false;
+  printPoolData();
 
   clock_data data = getClockData(mElapsed);
 
  // Create background sprite to print data at once
-  createBackgroundSprite(270,36);
+  CHECK_SPRITE_CREATED(270,36);
 
   // Print background screen
   background.pushImage(0, -130, minerClockWidth, minerClockHeight, minerClockScreen);
@@ -1533,7 +1704,7 @@ void esp32_2432S028R_ClockScreen(unsigned long mElapsed)
   // Delete sprite to free the memory heap
   background.deleteSprite(); 
 
-  createBackgroundSprite(169,105);
+  CHECK_SPRITE_CREATED(169,105);
   // Print background screen
   background.pushImage(-130, -3, minerClockWidth, minerClockHeight, minerClockScreen);
   
@@ -1556,6 +1727,8 @@ void esp32_2432S028R_ClockScreen(unsigned long mElapsed)
   // Delete sprite to free the memory heap
   background.deleteSprite();   
 
+  hasChangedScreen = false;
+
   Serial.printf(">>> Completed %s share(s), %s Khashes, avg. hashrate %s KH/s\n",
                 data.completedShares.c_str(), data.totalKHashes.c_str(), data.currentHashRate.c_str());
 
@@ -1567,16 +1740,27 @@ void esp32_2432S028R_ClockScreen(unsigned long mElapsed)
 
 void esp32_2432S028R_GlobalHashScreen(unsigned long mElapsed)
 {
-  if (hasChangedScreen) tft.pushImage(0, 0, globalHashWidth, globalHashHeight, globalHashScreen);
+  if (hasChangedScreen) {
+    tft.fillScreen(TFT_BLACK);
+    tft.pushImage(0, 0, globalHashWidth, globalHashHeight, globalHashScreen);
+  }
   
+  /*
+  if (networkFetchInProgress) {
+    if (hasChangedScreen) {
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.drawString("Updating network telemetry...", 10, 180, 2);
+    }
+    return;
+  }
+  */
+
   printPoolData();
-  
-  hasChangedScreen = false;
   
   coin_data data = getCoinData(mElapsed);
 
   // Create background sprite to print data at once
-  createBackgroundSprite(169,105);
+  CHECK_SPRITE_CREATED(169,105);
   // Print background screen
   background.pushImage(-160, -3, minerClockWidth, minerClockHeight, globalHashScreen);
   
@@ -1609,8 +1793,8 @@ void esp32_2432S028R_GlobalHashScreen(unsigned long mElapsed)
   // Delete sprite to free the memory heap
   background.deleteSprite();   
 
- // Create background sprite to print data at once
-  createBackgroundSprite(280,30);
+  // Create background sprite to print data at once
+  CHECK_SPRITE_CREATED(280,30);
   // Print background screen
   background.pushImage(0, -139, minerClockWidth, minerClockHeight, globalHashScreen);
   //background.fillSprite(TFT_CYAN);
@@ -1634,8 +1818,8 @@ void esp32_2432S028R_GlobalHashScreen(unsigned long mElapsed)
   // Delete sprite to free the memory heap
   background.deleteSprite();   
 
- // Create background sprite to print data at once
-  createBackgroundSprite(140,40);
+  // Create background sprite to print data at once
+  CHECK_SPRITE_CREATED(140,40);
   // Print background screen
   background.pushImage(-5, -100, minerClockWidth, minerClockHeight, globalHashScreen);
   //background.fillSprite(TFT_CYAN);
@@ -1648,6 +1832,8 @@ void esp32_2432S028R_GlobalHashScreen(unsigned long mElapsed)
   // Delete sprite to free the memory heap
   background.deleteSprite();   
 
+  hasChangedScreen = false;
+
   Serial.printf(">>> Completed %s share(s), %s Khashes, avg. hashrate %s KH/s\n",
                 data.completedShares.c_str(), data.totalKHashes.c_str(), data.currentHashRate.c_str());
 
@@ -1658,14 +1844,27 @@ void esp32_2432S028R_GlobalHashScreen(unsigned long mElapsed)
 }
 void esp32_2432S028R_BTCprice(unsigned long mElapsed)
 {
-  if (hasChangedScreen) tft.pushImage(0, 0, priceScreenWidth, priceScreenHeight, priceScreen);
+  if (hasChangedScreen) {
+    tft.fillScreen(TFT_BLACK);
+    tft.pushImage(0, 0, priceScreenWidth, priceScreenHeight, priceScreen);
+  }
+  
+  /*
+  if (networkFetchInProgress) {
+    if (hasChangedScreen) {
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.drawString("Updating network telemetry...", 10, 180, 2);
+    }
+    return;
+  }
+  */
+
   printPoolData();
-  hasChangedScreen = false;
 
   clock_data data = getClockData(mElapsed);
 
  // Create background sprite to print data at once
-  createBackgroundSprite(270,36);
+  CHECK_SPRITE_CREATED(270,36);
 
   // Print background screen
   background.pushImage(0, -130, priceScreenWidth, priceScreenHeight, priceScreen);
@@ -1683,7 +1882,7 @@ void esp32_2432S028R_BTCprice(unsigned long mElapsed)
   // Delete sprite to free the memory heap
   background.deleteSprite(); 
 
-  createBackgroundSprite(180,105);
+  CHECK_SPRITE_CREATED(180,105);
   // Print background screen
   background.pushImage(-130, -3, priceScreenWidth, priceScreenHeight, priceScreen);
   
@@ -1707,6 +1906,8 @@ void esp32_2432S028R_BTCprice(unsigned long mElapsed)
   // Delete sprite to free the memory heap
   background.deleteSprite();   
 
+  hasChangedScreen = false;
+
   Serial.printf(">>> Completed %s share(s), %s Khashes, avg. hashrate %s KH/s\n",
                 data.completedShares.c_str(), data.totalKHashes.c_str(), data.currentHashRate.c_str());
 
@@ -1714,6 +1915,349 @@ void esp32_2432S028R_BTCprice(unsigned long mElapsed)
   // Print heap
   printheap();
   #endif
+}
+
+void copySportsCache(SportsData &mlbDst, SportsData &nhlDst, SportsData &mlsDst) {
+  if (sportsDataMutex == nullptr) {
+    mlbDst = mlbCache;
+    nhlDst = nhlCache;
+    mlsDst = mlsCache;
+    return;
+  }
+  if (xSemaphoreTake(sportsDataMutex, 5 / portTICK_PERIOD_MS) == pdTRUE) {
+    mlbDst = mlbCache;
+    nhlDst = nhlCache;
+    mlsDst = mlsCache;
+    xSemaphoreGive(sportsDataMutex);
+  }
+}
+
+void storeSportsCache(const SportsData &mlbSrc, const SportsData &nhlSrc, const SportsData &mlsSrc) {
+  if (sportsDataMutex == nullptr) {
+    mlbCache = mlbSrc;
+    nhlCache = nhlSrc;
+    mlsCache = mlsSrc;
+    return;
+  }
+  if (xSemaphoreTake(sportsDataMutex, 50 / portTICK_PERIOD_MS) == pdTRUE) {
+    mlbCache = mlbSrc;
+    nhlCache = nhlSrc;
+    mlsCache = mlsSrc;
+    xSemaphoreGive(sportsDataMutex);
+  }
+}
+
+static bool populateSportsGame(JsonObjectConst gameObj, SportsData &outData) {
+  if (gameObj.isNull()) {
+    return false;
+  }
+  
+  outData.shortName = gameObj["o"] | "";
+  outData.status = gameObj["st"] | "";
+  
+  String scoreStr = gameObj["s"] | "";
+  outData.stlScore = "";
+  outData.oppScore = "";
+  outData.oppAbbrev = "";
+  outData.isStlHome = false;
+  
+  int dashIdx = scoreStr.indexOf('-');
+  String score1 = "";
+  String score2 = "";
+  if (dashIdx != -1) {
+    score1 = scoreStr.substring(0, dashIdx);
+    score1.trim();
+    score2 = scoreStr.substring(dashIdx + 1);
+    score2.trim();
+  } else {
+    outData.stlScore = scoreStr;
+  }
+  
+  int atIdx = outData.shortName.indexOf('@');
+  if (atIdx != -1) {
+    String teamAway = outData.shortName.substring(0, atIdx);
+    teamAway.trim();
+    String teamHome = outData.shortName.substring(atIdx + 1);
+    teamHome.trim();
+    
+    if (teamAway == "STL") {
+      outData.oppAbbrev = teamHome;
+      outData.isStlHome = false;
+      if (dashIdx != -1) {
+        outData.stlScore = score1;
+        outData.oppScore = score2;
+      }
+    } else if (teamHome == "STL") {
+      outData.oppAbbrev = teamAway;
+      outData.isStlHome = true;
+      if (dashIdx != -1) {
+        outData.stlScore = score2;
+        outData.oppScore = score1;
+      }
+    } else {
+      outData.oppAbbrev = teamHome;
+      outData.isStlHome = false;
+      if (dashIdx != -1) {
+        outData.stlScore = score1;
+        outData.oppScore = score2;
+      }
+    }
+  } else {
+    outData.oppAbbrev = "";
+    outData.isStlHome = false;
+    if (dashIdx != -1) {
+      outData.stlScore = score1;
+      outData.oppScore = score2;
+    }
+  }
+  
+  outData.hasGame = true;
+  outData.lastFetchMs = millis();
+  return true;
+}
+
+bool fetchSportsVercel(SportsData &mlbData, SportsData &nhlData, SportsData &mlsData) {
+  HTTPClient http;
+  http.setTimeout(8000);
+  http.setConnectTimeout(8000);
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  http.setReuse(false);
+
+  WiFiClientSecure secureClient;
+  secureClient.setTimeout(10000);
+  secureClient.setHandshakeTimeout(10000);
+  secureClient.setInsecure();
+
+  const char* url = "https://seans-forcasting.vercel.app/api/ticker";
+  Serial.printf("[DEBUG] fetchSportsVercel: Connecting to %s. Free heap: %u\n", url, ESP.getFreeHeap());
+  
+  bool began = http.begin(secureClient, url);
+  if (!began) {
+    Serial.println("[ERROR] fetchSportsVercel: HTTP begin failed");
+    return false;
+  }
+
+  http.addHeader("Accept", "application/json");
+  http.addHeader("User-Agent", "NerdMinerV2-Sports/1.0");
+
+  int httpCode = http.GET();
+  Serial.printf("[DEBUG] fetchSportsVercel: GET response code: %d. Free heap: %u\n", httpCode, ESP.getFreeHeap());
+
+  if (httpCode != HTTP_CODE_OK) {
+    http.end();
+    return false;
+  }
+
+  String payload = http.getString();
+  http.end();
+  
+  Serial.printf("[DEBUG] fetchSportsVercel: Successfully read payload (length = %u)\n", payload.length());
+
+  DynamicJsonDocument doc(4096);
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) {
+    Serial.printf("[ERROR] fetchSportsVercel: deserializeJson failed with code %s\n", err.c_str());
+    return false;
+  }
+
+  JsonObjectConst rootObj = doc.as<JsonObjectConst>();
+  if (!rootObj.containsKey("teams") || !rootObj["teams"].is<JsonArray>()) {
+    return false;
+  }
+
+  JsonArrayConst teams = rootObj["teams"].as<JsonArrayConst>();
+  bool mlbFound = false;
+  bool nhlFound = false;
+  bool mlsFound = false;
+
+  for (JsonObjectConst team : teams) {
+    String league = team["k"] | "";
+    if (league == "MLB") {
+      mlbFound = true;
+      if (team.containsKey("l") && !team["l"].isNull()) {
+        populateSportsGame(team["l"].as<JsonObjectConst>(), mlbData);
+      } else if (team.containsKey("t") && !team["t"].isNull()) {
+        populateSportsGame(team["t"].as<JsonObjectConst>(), mlbData);
+      } else if (team.containsKey("y") && !team["y"].isNull()) {
+        populateSportsGame(team["y"].as<JsonObjectConst>(), mlbData);
+      } else {
+        mlbData.hasGame = false;
+      }
+    } else if (league == "NHL") {
+      nhlFound = true;
+      if (team.containsKey("l") && !team["l"].isNull()) {
+        populateSportsGame(team["l"].as<JsonObjectConst>(), nhlData);
+      } else if (team.containsKey("t") && !team["t"].isNull()) {
+        populateSportsGame(team["t"].as<JsonObjectConst>(), nhlData);
+      } else if (team.containsKey("y") && !team["y"].isNull()) {
+        populateSportsGame(team["y"].as<JsonObjectConst>(), nhlData);
+      } else {
+        nhlData.hasGame = false;
+      }
+    } else if (league == "MLS") {
+      mlsFound = true;
+      if (team.containsKey("l") && !team["l"].isNull()) {
+        populateSportsGame(team["l"].as<JsonObjectConst>(), mlsData);
+      } else if (team.containsKey("t") && !team["t"].isNull()) {
+        populateSportsGame(team["t"].as<JsonObjectConst>(), mlsData);
+      } else if (team.containsKey("y") && !team["y"].isNull()) {
+        populateSportsGame(team["y"].as<JsonObjectConst>(), mlsData);
+      } else {
+        mlsData.hasGame = false;
+      }
+    }
+  }
+
+  return mlbFound || nhlFound || mlsFound;
+}
+
+void runSportsFetch() {
+  SportsData newMlb;
+  SportsData newNhl;
+  SportsData newMls;
+  
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WARNING] sportsFetchTask: WiFi disconnected, aborting fetch");
+    return;
+  }
+  
+  Serial.println("[DEBUG] sportsFetchTask: Fetching St. Louis sports scoreboard from Vercel...");
+  bool ok = fetchSportsVercel(newMlb, newNhl, newMls);
+  if (ok) {
+    SportsData oldMlb, oldNhl, oldMls;
+    copySportsCache(oldMlb, oldNhl, oldMls);
+    storeSportsCache(newMlb.hasGame ? newMlb : oldMlb, newNhl.hasGame ? newNhl : oldNhl, newMls.hasGame ? newMls : oldMls);
+  } else {
+    Serial.println("[ERROR] sportsFetchTask: Vercel sports fetch failed");
+  }
+}
+
+void maybeStartSportsFetch() {
+  maybeStartTickerFetch();
+}
+
+static String lastRenderedSportsHash = "";
+static int lastRenderedSportsScreen = -1;
+
+static void drawSportsCard(int cardY, const char* title, const SportsData& data) {
+  tft.fillRoundRect(10, cardY, 300, 52, 6, TC_CARD);
+  tft.drawRoundRect(10, cardY, 300, 52, 6, TC_BORDER);
+
+  tft.setTextColor(TC_ACCENT, TC_CARD);
+  tft.drawString(title, 20, cardY + 6, 1);
+  
+  String status = data.hasGame ? data.status : "No Game Today";
+  tft.setTextColor(TC_SEC, TC_CARD);
+  tft.setTextDatum(TR_DATUM);
+  tft.drawString(status, 300, cardY + 6, 1);
+  tft.setTextDatum(TL_DATUM);
+
+  if (data.hasGame) {
+    String teamAway = "";
+    String teamHome = "";
+    String scoreAway = "";
+    String scoreHome = "";
+    
+    int atIdx = data.shortName.indexOf('@');
+    if (atIdx != -1) {
+      teamAway = data.shortName.substring(0, atIdx);
+      teamAway.trim();
+      teamHome = data.shortName.substring(atIdx + 1);
+      teamHome.trim();
+    } else {
+      teamAway = "STL";
+      teamHome = data.oppAbbrev;
+    }
+    
+    if (data.isStlHome) {
+      scoreAway = data.oppScore;
+      scoreHome = data.stlScore;
+    } else {
+      scoreAway = data.stlScore;
+      scoreHome = data.oppScore;
+    }
+
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(TFT_WHITE, TC_CARD);
+    tft.drawString(teamAway, 30, cardY + 24, 2);
+    tft.drawString(scoreAway, 110, cardY + 24, 2);
+    
+    tft.setTextColor(TC_DIM, TC_CARD);
+    tft.drawString("@", 152, cardY + 26, 2);
+    
+    tft.setTextColor(TFT_WHITE, TC_CARD);
+    tft.drawString(scoreHome, 190, cardY + 24, 2);
+    
+    tft.setTextDatum(TR_DATUM);
+    tft.drawString(teamHome, 290, cardY + 24, 2);
+    tft.setTextDatum(TL_DATUM);
+  } else {
+    tft.setTextColor(TC_DIM, TC_CARD);
+    tft.setTextDatum(TC_DATUM);
+    tft.drawString("No game scheduled today", 160, cardY + 26, 2);
+    tft.setTextDatum(TL_DATUM);
+  }
+}
+
+void drawSportsPage() {
+  maybeStartSportsFetch();
+
+  SportsData mlb;
+  SportsData nhl;
+  SportsData mls;
+  copySportsCache(mlb, nhl, mls);
+
+  String hash = mlb.shortName + mlb.status + mlb.stlScore + mlb.oppScore +
+                nhl.shortName + nhl.status + nhl.stlScore + nhl.oppScore +
+                mls.shortName + mls.status + mls.stlScore + mls.oppScore;
+  const bool screenChanged = (lastRenderedSportsScreen != currentDisplayDriver->current_cyclic_screen);
+  const bool changed = screenChanged || (hash != lastRenderedSportsHash);
+  
+  if (changed) {
+    tft.fillScreen(TC_BG);
+    lastRenderedSportsHash = hash;
+    lastRenderedSportsScreen = currentDisplayDriver->current_cyclic_screen;
+  }
+
+  if (!changed) return;
+
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(TFT_WHITE, TC_BG);
+  tft.drawString("ST. LOUIS SPORTS", 10, 5, 2);
+  
+  tft.setTextColor(TC_DIM, TC_BG);
+  const String rightLabel = "LIVE SCORES";
+  tft.drawString(rightLabel, 310 - tft.textWidth(rightLabel, 1), 5, 1);
+  
+  drawHRule(25);
+
+  drawSportsCard(30, "MLB - CARDINALS", mlb);
+  drawSportsCard(88, "NHL - BLUES", nhl);
+  drawSportsCard(146, "MLS - CITY SC", mls);
+
+  drawHRule(212);
+  
+  tft.setTextColor(TC_DIM, TC_BG);
+  tft.drawString("NerdMiner v2", 10, 218, 1);
+  
+  String updateTimeStr = "Updated: ";
+  unsigned long lastFetch = mlb.lastFetchMs;
+  if (nhl.lastFetchMs > lastFetch) lastFetch = nhl.lastFetchMs;
+  if (mls.lastFetchMs > lastFetch) lastFetch = mls.lastFetchMs;
+
+  if (lastFetch == 0) {
+    updateTimeStr += "Never";
+  } else {
+    updateTimeStr += String((millis() - lastFetch) / 1000) + "s ago";
+  }
+  tft.setTextDatum(TR_DATUM);
+  tft.drawString(updateTimeStr, 310, 218, 1);
+  tft.setTextDatum(TL_DATUM);
+}
+
+void esp32_2432S028R_SportsScreen(unsigned long mElapsed)
+{
+  drawSportsPage();
 }
 
 void esp32_2432S028R_TickerScreen(unsigned long mElapsed)
@@ -1769,9 +2313,22 @@ void esp32_2432S028R_DoLedStuff(unsigned long frame)
 {
   unsigned long currentMillis = millis();    
   int16_t t_x, t_y;
-  bool pressed = touch.getXY(t_x, t_y);
+  bool pressed = false;
+
+  #ifdef TOUCH_IRQ
+  if (digitalRead(TOUCH_IRQ) == LOW) {
+    pressed = touch.getXY(t_x, t_y);
+  }
+  #else
+  pressed = touch.getXY(t_x, t_y);
+  #endif
 
   if (pressed) {
+    static unsigned long lastTouchPrint = 0;
+    if (currentMillis - lastTouchPrint > 1000) {
+      Serial.printf("[DEBUG] Touch registered: x=%d, y=%d\n", t_x, t_y);
+      lastTouchPrint = currentMillis;
+    }
     if (!touchTracking) {
       touchTracking = true;
       touchStartX = t_x;
@@ -1782,6 +2339,7 @@ void esp32_2432S028R_DoLedStuff(unsigned long frame)
   } else if (touchTracking && (currentMillis - touchGestureLastMs >= TOUCH_GESTURE_DEBOUNCE_MS)) {
     int dx = touchLastX - touchStartX;
     int dy = touchLastY - touchStartY;
+    Serial.printf("[DEBUG] Touch gesture end: dx=%d, dy=%d\n", dx, dy);
 
     if (abs(dx) > SWIPE_THRESHOLD_PX && abs(dx) > abs(dy)) {
       if (dx < 0) {
@@ -1820,7 +2378,9 @@ void esp32_2432S028R_DoLedStuff(unsigned long frame)
 
   maybeAutoScroll(currentMillis);
 
-    if (currentScreen != currentDisplayDriver->current_cyclic_screen) hasChangedScreen ^= true;
+    if (currentScreen != currentDisplayDriver->current_cyclic_screen) {
+      hasChangedScreen = true;
+    }
     currentScreen = currentDisplayDriver->current_cyclic_screen;
 
   if (!Settings.rearLedEnabled) {
@@ -1862,6 +2422,8 @@ void esp32_2432S028R_DoLedStuff(unsigned long frame)
 CyclicScreenFunction esp32_2432S028RCyclicScreens[] = {
   esp32_2432S028R_TickerScreen,
   esp32_2432S028R_CandleScreen,
+  esp32_2432S028R_SportsScreen,
+  esp32_2432S028R_MinerScreen,
   esp32_2432S028R_SettingsScreen
 };
 

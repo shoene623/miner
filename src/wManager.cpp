@@ -26,9 +26,80 @@ bool shouldSaveConfig = false;
 // Variables to hold data from custom textboxes
 TSettings Settings;
 
+// Structures copied from display driver to access caches
+struct CandlePoint {
+  float open = 0.0f;
+  float high = 0.0f;
+  float low = 0.0f;
+  float close = 0.0f;
+  float volume = 0.0f;
+};
+
+constexpr int CANDLE_MAX_POINTS = 24;
+struct CandleSeries {
+  String price;
+  String direction;
+  String move;
+  int count = 0;
+  CandlePoint points[CANDLE_MAX_POINTS];
+};
+
+struct TickerData {
+  String sentiment;
+  String direction;
+  String category;
+  String recommendation;
+  String daily;
+  String weekly;
+  String monthly;
+  String btcDirection;
+  String btcEntry;
+  String btcTakeProfit;
+  String xrpDirection;
+  String xrpEntry;
+  String xrpTakeProfit;
+  String btcPrice;
+  String btcChange24h;
+  String xrpPrice;
+  String xrpChange24h;
+  String candleWindow;
+  String candleTf;
+  String candleUpdated;
+  CandleSeries btcCandles;
+  CandleSeries ethCandles;
+  CandleSeries xrpCandles;
+  String greeting;
+  String updated;
+  String status;
+};
+
+struct SportsData {
+  String shortName = "";
+  String status = "";
+  String stlScore = "";
+  String oppScore = "";
+  String oppAbbrev = "";
+  bool isStlHome = false;
+  bool hasGame = false;
+  unsigned long lastFetchMs = 0;
+};
+
 // Define WiFiManager Object
 WiFiManager wm;
 extern monitor_data mMonitor;
+extern volatile double currentPoolDifficultyLive;
+extern pool_data pData;
+
+// Fallback weak definitions so environments without display-based tickers can compile cleanly.
+TickerData tickerCache __attribute__((weak));
+SportsData mlbCache __attribute__((weak));
+SportsData nhlCache __attribute__((weak));
+SemaphoreHandle_t tickerDataMutex __attribute__((weak)) = nullptr;
+SemaphoreHandle_t sportsDataMutex __attribute__((weak)) = nullptr;
+
+extern unsigned int bitcoin_price;
+extern String current_block;
+extern global_data gData;
 
 nvMemory nvMem;
 WebServer settingsWebServer(80);
@@ -121,24 +192,248 @@ static void normalizePoolEndpoint(String &poolAddress, int &poolPort) {
 
 static String renderMonitorPageHtml() {
     String html;
-    html.reserve(4200);
+    html.reserve(7500); // Expanded capacity for beautiful styling & dashboard widgets
     html += "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
-    html += "<title>NerdMiner Monitor</title>";
-    html += "<style>body{font-family:Arial,sans-serif;margin:0;background:#0d1311;color:#e8f7ef}main{max-width:980px;margin:0 auto;padding:14px}.top{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px}.btn{display:inline-block;padding:8px 12px;border-radius:8px;border:1px solid #2c4b3d;background:#183127;color:#dfffee;text-decoration:none;font-weight:700}.btn.p{background:#2a9c63;border-color:#39be79;color:#fff}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}.card{background:#12211a;border:1px solid #2f4d3f;border-radius:10px;padding:10px}.k{font-size:11px;color:#9fc7b4;text-transform:uppercase}.v{margin-top:6px;font-size:18px;font-weight:700;word-break:break-word}.ok{color:#72f5ad}.warn{color:#ffd280}.mono{font-family:Consolas,monospace}.foot{margin-top:12px;color:#9cb9ad;font-size:12px}</style></head><body>";
-    html += "<main><div class='top'><a class='btn' href='/settings'>Settings</a><a class='btn' href='/api/status'>JSON</a><button class='btn p' id='refresh'>Refresh</button></div>";
+    html += "<title>Patrick's Bitcoin Miner Hub</title>";
+    html += "<link href='https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;800&family=Share+Tech+Mono&display=swap' rel='stylesheet'>";
+    html += "<style>"
+            "body{background:#04070c;background-image:radial-gradient(circle at 50% 30%,#091322 0%,#04070c 80%);color:#f1f5f9;font-family:'Outfit',sans-serif;margin:0;padding:0;min-height:100vh}"
+            "main{max-width:1200px;margin:0 auto;padding:24px}"
+            "header{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid rgba(0,240,255,0.15);padding-bottom:16px;margin-bottom:24px;flex-wrap:wrap;gap:12px}"
+            "h1{font-size:26px;font-weight:800;margin:0;background:linear-gradient(135deg,#00f0ff 0%,#00ff9f 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent;text-shadow:0 0 20px rgba(0,240,255,0.25)}"
+            ".status-badge{display:flex;align-items:center;gap:8px;background:rgba(0,255,159,0.05);border:1px solid rgba(0,255,159,0.25);padding:6px 14px;border-radius:20px;font-size:13px;font-weight:600;color:#00ff9f}"
+            ".pulse{width:8px;height:8px;background-color:#00ff9f;border-radius:50%;box-shadow:0 0 10px #00ff9f;animation:pulse-anim 2s infinite}"
+            "@keyframes pulse-anim{0%{transform:scale(0.95);box-shadow:0 0 0 0 rgba(0,255,159,0.7)}70%{transform:scale(1);box-shadow:0 0 0 8px rgba(0,255,159,0)}100%{transform:scale(0.95);box-shadow:0 0 0 0 rgba(0,255,159,0)}}"
+            ".btn-group{display:flex;gap:12px;margin-bottom:24px}"
+            ".btn{display:inline-block;padding:10px 20px;border-radius:8px;border:1px solid rgba(0,240,255,0.2);background:rgba(0,240,255,0.03);color:#e2e8f0;text-decoration:none;font-weight:700;font-size:14px;transition:all 0.2s ease;cursor:pointer;outline:none}"
+            ".btn:hover{background:#00f0ff;color:#04070c;box-shadow:0 0 15px rgba(0,240,255,0.4);border-color:#00f0ff;transform:translateY(-1px)}"
+            ".btn.p{background:rgba(0,255,159,0.08);border-color:rgba(0,255,159,0.25);color:#00ff9f}"
+            ".btn.p:hover{background:#00ff9f;color:#04070c;box-shadow:0 0 15px rgba(0,255,159,0.4);border-color:#00ff9f}"
+            ".section-title{font-size:13px;font-weight:800;text-transform:uppercase;letter-spacing:2px;color:#00f0ff;margin:28px 0 16px;display:flex;align-items:center;gap:10px}"
+            ".section-title::after{content:'';flex-grow:1;height:1px;background:linear-gradient(90deg,rgba(0,240,255,0.15) 0%,transparent 100%)}"
+            ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px}"
+            ".card{background:rgba(13,20,30,0.45);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border:1px solid rgba(0,240,255,0.1);border-radius:14px;padding:16px;transition:all 0.3s ease;position:relative}"
+            ".card:hover{border-color:rgba(0,240,255,0.3);box-shadow:0 0 20px rgba(0,240,255,0.12);transform:translateY(-2px)}"
+            ".card-k{font-size:11px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:1px}"
+            ".card-v{margin-top:6px;font-size:22px;font-weight:800;font-family:'Share Tech Mono',monospace;color:#f8fafc}"
+            ".card-s{margin-top:6px;font-size:12px;color:#64748b;display:flex;justify-content:space-between}"
+            ".green{color:#00ff9f}.blue{color:#00f0ff}.pink{color:#ff007f}.orange{color:#ffd280}.red{color:#f87171}"
+            ".scoreboard{display:flex;flex-direction:column;gap:10px}"
+            ".matchup{display:flex;justify-content:space-between;align-items:center;padding:6px 0}"
+            ".team{display:flex;align-items:center;gap:8px;font-weight:700;font-size:16px}"
+            ".team.active{color:#00ff9f}"
+            ".score{font-family:'Share Tech Mono',monospace;font-size:20px;font-weight:800}"
+            ".match-status{font-size:12px;color:#94a3b8;text-align:right}"
+            ".footer{margin-top:40px;padding-top:16px;border-top:1px solid rgba(0,240,255,0.1);color:#64748b;font-size:12px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px}"
+            "</style></head><body>";
+    html += "<main>";
+    html += "<header><h1 id='welcomeGreeting'>Welcome, Patrick!</h1>";
+    html += "<div class='status-badge'><div class='pulse'></div><span id='ip'>CONNECTING...</span></div></header>";
+    html += "<div class='btn-group'>";
+    html += "<a class='btn' href='/settings'>System Configuration</a>";
+    html += "<a class='btn' href='/api/status' target='_blank'>Developer JSON API</a>";
+    html += "<button class='btn p' id='refresh'>Sync Core Metrics</button>";
+    html += "</div>";
+
+    // Section 1: Hashing Status
+    html += "<div class='section-title'>System Mining Engine</div>";
     html += "<div class='grid'>";
-    html += "<div class='card'><div class='k'>Device IP</div><div class='v mono' id='ip'>--</div></div>";
-    html += "<div class='card'><div class='k'>Hashrate</div><div class='v' id='hashrate'>--</div></div>";
-    html += "<div class='card'><div class='k'>Shares / Valids</div><div class='v' id='shares'>--</div></div>";
-    html += "<div class='card'><div class='k'>Submit Attempts</div><div class='v' id='submits'>--</div></div>";
-    html += "<div class='card'><div class='k'>Pool Difficulty</div><div class='v' id='pdiff'>--</div></div>";
-    html += "<div class='card'><div class='k'>Workers</div><div class='v' id='workers'>--</div></div>";
-    html += "<div class='card'><div class='k'>Best Diff Local</div><div class='v' id='bestLocal'>--</div></div>";
-    html += "<div class='card'><div class='k'>Best Diff Pool</div><div class='v' id='bestPool'>--</div></div>";
-    html += "<div class='card'><div class='k'>Uptime</div><div class='v' id='uptime'>--</div></div>";
-    html += "<div class='card'><div class='k'>Pool API URL</div><div class='v mono' id='api'>--</div></div>";
-    html += "</div><div class='foot' id='stamp'>Waiting for data...</div></main>";
-    html += "<script>let refreshing=false;async function refresh(){if(refreshing)return;refreshing=true;try{const r=await fetch('/api/status',{cache:'no-store'});const d=await r.json();const m=d.mining||{},p=d.pool||{};document.getElementById('ip').textContent=d.ip||'--';document.getElementById('hashrate').textContent=(m.hashrate||'0.00')+' KH/s';document.getElementById('shares').textContent=(m.shares||'0')+' / '+(m.valids||'0');document.getElementById('submits').textContent=m.submitAttempts||'0';document.getElementById('pdiff').textContent=m.poolDifficulty||'--';document.getElementById('workers').textContent=(p.workersCount||0)+' / '+(p.workersHash||'--');document.getElementById('bestLocal').textContent=m.bestDiff||'--';document.getElementById('bestPool').textContent=p.bestDifficulty||'--';document.getElementById('uptime').textContent=m.uptime||'--';document.getElementById('api').textContent=p.apiUrl||'--';document.getElementById('stamp').textContent='Updated '+new Date().toLocaleTimeString();}catch(e){document.getElementById('stamp').textContent='Fetch failed: '+e;}finally{refreshing=false;}}document.getElementById('refresh').addEventListener('click',refresh);refresh();</script></body></html>";
+    html += "<div class='card'><div class='card-k'>Hashrate</div><div class='card-v blue' id='hashrate'>--</div><div class='card-s'><span>Performance Speed</span></div></div>";
+    html += "<div class='card'><div class='card-k'>Shares / Valids</div><div class='card-v green' id='shares'>--</div><div class='card-s'><span>NVS Pool Submissions</span></div></div>";
+    html += "<div class='card'><div class='card-k'>Local Best Diff</div><div class='card-v orange' id='bestLocal'>--</div><div class='card-s'><span>Nerdminer Best Job</span></div></div>";
+    html += "<div class='card'><div class='card-k'>Engine Uptime</div><div class='card-v' id='uptime'>--</div><div class='card-s'><span>Days  HH:MM:SS</span></div></div>";
+    html += "</div>";
+
+    // Section 2: Blockchain Stats
+    html += "<div class='section-title'>Bitcoin Network Core</div>";
+    html += "<div class='grid'>";
+    html += "<div class='card'><div class='card-k'>Bitcoin Price</div><div class='card-v green' id='btcPrice'>--</div><div class='card-s'><span>CoinGecko Live API</span></div></div>";
+    html += "<div class='card'><div class='card-k'>Tip Block Height</div><div class='card-v blue' id='blockHeight'>--</div><div class='card-s'><span>Mempool Tip height</span></div></div>";
+    html += "<div class='card'><div class='card-k'>Half-Hour Gas Fee</div><div class='card-v pink' id='feeRate'>--</div><div class='card-s'><span>Recommended Sat/vB</span></div></div>";
+    html += "<div class='card'><div class='card-k'>Halving Status</div><div class='card-v orange' id='halvingText'>--</div><div class='card-s'><span id='halvingPct'>--</span></div></div>";
+    html += "</div>";
+
+    // Section 3: Sentiment & Sports (Double Column Flex Grid)
+    html += "<div class='section-title'>Geopolitical Intelligence & Sports hub</div>";
+    html += "<div class='grid'>";
+    // Geopolitical/Market Sentiment Card
+    html += "<div class='card' style='grid-column: span 1'>"
+            "<div class='card-k' style='margin-bottom:12px'>Crypto Market Sentiment</div>"
+            "<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:12px'>"
+              "<span style='font-size:15px;font-weight:600' id='sentimentCat'>--</span>"
+              "<span class='card-v blue' style='font-size:26px;margin:0' id='sentimentScore'>--</span>"
+            "</div>"
+            "<div style='font-size:13px;line-height:1.4;color:#cbd5e1;background:rgba(0,240,255,0.04);border:1px solid rgba(0,240,255,0.1);border-radius:8px;padding:8px;margin-bottom:12px' id='sentimentRec'>--</div>"
+            "<div style='display:grid;grid-template-columns:1fr 1fr;gap:10px;font-size:12px'>"
+              "<div style='background:rgba(0,255,159,0.04);border:1px solid rgba(0,255,159,0.15);border-radius:6px;padding:6px'>"
+                "<div style='font-weight:700;color:#00ff9f'>BTC Trade Setup</div>"
+                "<div style='margin-top:4px'>Entry: <span id='btcEntry'>--</span></div>"
+                "<div>Target: <span id='btcTarget'>--</span></div>"
+              "</div>"
+              "<div style='background:rgba(255,0,127,0.04);border:1px solid rgba(255,0,127,0.15);border-radius:6px;padding:6px'>"
+                "<div style='font-weight:700;color:#ff007f'>XRP Trade Setup</div>"
+                "<div style='margin-top:4px'>Entry: <span id='xrpEntry'>--</span></div>"
+                "<div>Target: <span id='xrpTarget'>--</span></div>"
+              "</div>"
+            "</div>"
+          "</div>";
+    // St. Louis Sports Card
+    html += "<div class='card' style='grid-column: span 1'>"
+            "<div class='card-k' style='margin-bottom:12px'>St. Louis Live Scoreboard</div>"
+            "<div class='scoreboard'>"
+              // MLB
+              "<div style='border-bottom:1px solid rgba(255,255,255,0.06);padding-bottom:10px'>"
+                "<div style='display:flex;justify-content:space-between;align-items:center;font-size:11px;font-weight:700;color:#00f0ff;margin-bottom:6px'><span>MLB - CARDINALS</span><span class='match-status' id='mlbStatus'>--</span></div>"
+                "<div class='matchup'>"
+                  "<div class='team' id='mlbAwayName'>STL</div>"
+                  "<div class='score' id='mlbAwayScore'>--</div>"
+                "</div>"
+                "<div class='matchup'>"
+                  "<div class='team' id='mlbHomeName'>OPP</div>"
+                  "<div class='score' id='mlbHomeScore'>--</div>"
+                "</div>"
+              "</div>"
+              // NHL
+              "<div>"
+                "<div style='display:flex;justify-content:space-between;align-items:center;font-size:11px;font-weight:700;color:#ff007f;margin-bottom:6px'><span>NHL - BLUES</span><span class='match-status' id='nhlStatus'>--</span></div>"
+                "<div class='matchup'>"
+                  "<div class='team' id='nhlAwayName'>STL</div>"
+                  "<div class='score' id='nhlAwayScore'>--</div>"
+                "</div>"
+                "<div class='matchup'>"
+                  "<div class='team' id='nhlHomeName'>OPP</div>"
+                  "<div class='score' id='nhlHomeScore'>--</div>"
+                "</div>"
+              "</div>"
+            "</div>"
+          "</div>";
+    html += "</div>";
+
+    // Section 4: System Resource Diagnostics
+    html += "<div class='section-title'>System Resource Diagnostics</div>";
+    html += "<div class='grid'>";
+    html += "<div class='card'><div class='card-k'>Free RAM / Heap</div><div class='card-v blue' id='freeHeap'>--</div><div class='card-s'><span>Available heap memory</span></div></div>";
+    html += "<div class='card'><div class='card-k'>Min Free RAM (Watermark)</div><div class='card-v pink' id='minFreeHeap'>--</div><div class='card-s'><span>Lowest RAM reached</span></div></div>";
+    html += "<div class='card'><div class='card-k'>Max Contiguous Block</div><div class='card-v green' id='maxAllocHeap'>--</div><div class='card-s'><span>Largest alloc block</span></div></div>";
+    html += "<div class='card'><div class='card-k'>Total Heap Size</div><div class='card-v' id='heapSize'>--</div><div class='card-s'><span>Device boot memory</span></div></div>";
+    html += "</div>";
+
+    // Footer & Credits
+    html += "<div class='footer'>"
+            "<span>NerdMiner v2 - Active Hub</span>"
+            "<span id='stamp'>Syncing telemetry...</span>"
+            "</div>";
+    html += "</main>";
+
+    // JS Telemetry Sync Engine
+    html += "<script>"
+            "let refreshing=false;"
+            "async function refresh(){"
+              "if(refreshing)return;"
+              "refreshing=true;"
+              "document.getElementById('refresh').textContent='Syncing...';"
+              "try{"
+                "const r=await fetch('/api/status',{cache:'no-store'});"
+                "const d=await r.json();"
+                "const m=d.mining||{}, p=d.pool||{}, bc=d.blockchain||{}, s=d.sentiment||{}, sp=d.sports||{}, sys=d.system||{};"
+                // System IP
+                "document.getElementById('ip').textContent=d.ip||'--';"
+                "document.getElementById('welcomeGreeting').textContent=s.greeting||'Welcome, Patrick!';"
+                // Hashing
+                "document.getElementById('hashrate').textContent=(m.hashrate||'0.00')+' KH/s';"
+                "document.getElementById('shares').textContent=(m.shares||'0')+' / '+(m.valids||'0');"
+                "document.getElementById('bestLocal').textContent=m.bestDiff||'--';"
+                "document.getElementById('uptime').textContent=m.uptime||'--';"
+                // System Diagnostics
+                "document.getElementById('freeHeap').textContent=sys.freeHeap ? (Number(sys.freeHeap)/1024).toFixed(1)+' KB' : '--';"
+                "document.getElementById('minFreeHeap').textContent=sys.minFreeHeap ? (Number(sys.minFreeHeap)/1024).toFixed(1)+' KB' : '--';"
+                "document.getElementById('maxAllocHeap').textContent=sys.maxAllocHeap ? (Number(sys.maxAllocHeap)/1024).toFixed(1)+' KB' : '--';"
+                "document.getElementById('heapSize').textContent=sys.heapSize ? (Number(sys.heapSize)/1024).toFixed(1)+' KB' : '--';"
+                // Blockchain
+                "document.getElementById('btcPrice').textContent=bc.btcPrice ? ('$'+Number(bc.btcPrice).toLocaleString()) : '--';"
+                "document.getElementById('blockHeight').textContent=bc.blockHeight||'--';"
+                "document.getElementById('feeRate').textContent=bc.halfHourFee ? (bc.halfHourFee+' sat/vB') : '--';"
+                "if(bc.remainingBlocks){"
+                  "document.getElementById('halvingText').textContent=bc.remainingBlocks+' blocks';"
+                  "document.getElementById('halvingPct').textContent='Difficulty: '+(bc.difficulty||'--');"
+                "} else {"
+                  "document.getElementById('halvingText').textContent='--';"
+                  "document.getElementById('halvingPct').textContent='--';"
+                "}"
+                // Sentiment
+                "document.getElementById('sentimentScore').textContent=s.score||'--';"
+                "document.getElementById('sentimentCat').textContent=s.category + ' (' + s.direction + ')';"
+                "document.getElementById('sentimentRec').textContent=s.recommendation||'--';"
+                "document.getElementById('btcEntry').textContent=s.btcEntry ? ('$'+Number(s.btcEntry).toLocaleString()) : '--';"
+                "document.getElementById('btcTarget').textContent=s.btcTakeProfit ? ('$'+Number(s.btcTakeProfit).toLocaleString()) : '--';"
+                "document.getElementById('xrpEntry').textContent=s.xrpEntry ? ('$'+parseFloat(s.xrpEntry).toFixed(3)) : '--';"
+                "document.getElementById('xrpTarget').textContent=s.xrpTakeProfit ? ('$'+parseFloat(s.xrpTakeProfit).toFixed(3)) : '--';"
+                // Sports - MLB Cardinals
+                "let mlbAway = document.getElementById('mlbAwayName');"
+                "let mlbHome = document.getElementById('mlbHomeName');"
+                "mlbAway.className = 'team';"
+                "mlbHome.className = 'team';"
+                "if(sp.mlb && sp.mlb.hasGame){"
+                  "document.getElementById('mlbStatus').textContent=sp.mlb.status||'--';"
+                  "if(sp.mlb.isStlHome){"
+                    "mlbAway.textContent=sp.mlb.oppAbbrev||'OPP';"
+                    "document.getElementById('mlbAwayScore').textContent=sp.mlb.oppScore!=='' ? sp.mlb.oppScore : '0';"
+                    "mlbHome.textContent='STL';"
+                    "mlbHome.classList.add('green');"
+                    "document.getElementById('mlbHomeScore').textContent=sp.mlb.stlScore!=='' ? sp.mlb.stlScore : '0';"
+                  "} else {"
+                    "mlbAway.textContent='STL';"
+                    "mlbAway.classList.add('green');"
+                    "document.getElementById('mlbAwayScore').textContent=sp.mlb.stlScore!=='' ? sp.mlb.stlScore : '0';"
+                    "mlbHome.textContent=sp.mlb.oppAbbrev||'OPP';"
+                    "document.getElementById('mlbHomeScore').textContent=sp.mlb.oppScore!=='' ? sp.mlb.oppScore : '0';"
+                  "}"
+                "} else {"
+                  "document.getElementById('mlbStatus').textContent='No Game';"
+                  "mlbAway.textContent='STL';"
+                  "document.getElementById('mlbAwayScore').textContent='--';"
+                  "mlbHome.textContent='OPP';"
+                  "document.getElementById('mlbHomeScore').textContent='--';"
+                "}"
+                // Sports - NHL Blues
+                "let nhlAway = document.getElementById('nhlAwayName');"
+                "let nhlHome = document.getElementById('nhlHomeName');"
+                "nhlAway.className = 'team';"
+                "nhlHome.className = 'team';"
+                "if(sp.nhl && sp.nhl.hasGame){"
+                  "document.getElementById('nhlStatus').textContent=sp.nhl.status||'--';"
+                  "if(sp.nhl.isStlHome){"
+                    "nhlAway.textContent=sp.nhl.oppAbbrev||'OPP';"
+                    "document.getElementById('nhlAwayScore').textContent=sp.nhl.oppScore!=='' ? sp.nhl.oppScore : '0';"
+                    "nhlHome.textContent='STL';"
+                    "nhlHome.classList.add('pink');"
+                    "document.getElementById('nhlHomeScore').textContent=sp.nhl.stlScore!=='' ? sp.nhl.stlScore : '0';"
+                  "} else {"
+                    "nhlAway.textContent='STL';"
+                    "nhlAway.classList.add('pink');"
+                    "document.getElementById('nhlAwayScore').textContent=sp.nhl.stlScore!=='' ? sp.nhl.stlScore : '0';"
+                    "nhlHome.textContent=sp.nhl.oppAbbrev||'OPP';"
+                    "document.getElementById('nhlHomeScore').textContent=sp.nhl.oppScore!=='' ? sp.nhl.oppScore : '0';"
+                  "}"
+                "} else {"
+                  "document.getElementById('nhlStatus').textContent='No Game';"
+                  "nhlAway.textContent='STL';"
+                  "document.getElementById('nhlAwayScore').textContent='--';"
+                  "nhlHome.textContent='OPP';"
+                  "document.getElementById('nhlHomeScore').textContent='--';"
+                "}"
+                "document.getElementById('stamp').textContent='Telemetry synced at '+new Date().toLocaleTimeString();"
+              "}catch(e){"
+                "document.getElementById('stamp').textContent='Telemetry Sync Failed: '+e;"
+              "}finally{"
+                "refreshing=false;"
+                "document.getElementById('refresh').textContent='Sync Core Metrics';"
+              "}"
+            "}"
+            "document.getElementById('refresh').addEventListener('click',refresh);"
+            "refresh();"
+            "setInterval(refresh,15000);" // Auto-refresh telemetry every 15 seconds
+            "</script></body></html>";
     return html;
 }
 
@@ -166,6 +461,8 @@ static String renderSettingsPageHtml(const String &message = "") {
     html += "<input id='btcWallet' name='btcWallet' type='text' maxlength='79' value='" + htmlEscape(String(Settings.BtcWallet)) + "'>";
     html += "<label for='timezone'>Timezone (UTC offset)</label>";
     html += "<input id='timezone' name='timezone' type='text' maxlength='4' value='" + String(Settings.Timezone) + "'>";
+    html += "<label for='autoScrollInterval'>Screen Rotation Interval (seconds)</label>";
+    html += "<input id='autoScrollInterval' name='autoScrollInterval' type='text' maxlength='4' value='" + String(Settings.autoScrollInterval) + "'>";
     html += "<label><input name='rearLedEnabled' type='checkbox' value='1'";
     if (Settings.rearLedEnabled) {
         html += " checked";
@@ -188,6 +485,7 @@ static void handleSettingsSave() {
     if (settingsWebServer.hasArg("poolAddress")) {
         String address = settingsWebServer.arg("poolAddress");
         address.trim();
+        if (address.length() > 79) address = address.substring(0, 79);
         if (!address.isEmpty()) Settings.PoolAddress = address;
     }
 
@@ -203,6 +501,7 @@ static void handleSettingsSave() {
     if (settingsWebServer.hasArg("poolPassword")) {
         String pass = settingsWebServer.arg("poolPassword");
         pass.trim();
+        if (pass.length() > 79) pass = pass.substring(0, 79);
         strncpy(Settings.PoolPassword, pass.c_str(), sizeof(Settings.PoolPassword) - 1);
         Settings.PoolPassword[sizeof(Settings.PoolPassword) - 1] = '\0';
     }
@@ -210,6 +509,7 @@ static void handleSettingsSave() {
     if (settingsWebServer.hasArg("btcWallet")) {
         String wallet = settingsWebServer.arg("btcWallet");
         wallet.trim();
+        if (wallet.length() > 79) wallet = wallet.substring(0, 79);
         strncpy(Settings.BtcWallet, wallet.c_str(), sizeof(Settings.BtcWallet) - 1);
         Settings.BtcWallet[sizeof(Settings.BtcWallet) - 1] = '\0';
     }
@@ -219,6 +519,13 @@ static void handleSettingsSave() {
         if (tz < -12) tz = -12;
         if (tz > 14) tz = 14;
         Settings.Timezone = tz;
+    }
+
+    if (settingsWebServer.hasArg("autoScrollInterval")) {
+        int interval = settingsWebServer.arg("autoScrollInterval").toInt();
+        if (interval < 3) interval = 3;
+        if (interval > 3600) interval = 3600;
+        Settings.autoScrollInterval = interval;
     }
 
     Settings.rearLedEnabled = settingsWebServer.hasArg("rearLedEnabled");
@@ -237,7 +544,22 @@ static void handleStatusJson() {
     const unsigned long elapsed = 1000;
     mining_data miningData = getMiningData(elapsed);
 
-    DynamicJsonDocument doc(768);
+    // Safely copy sports and sentiment data under mutex
+    TickerData localTicker;
+    SportsData localMlb;
+    SportsData localNhl;
+
+    if (tickerDataMutex != nullptr && xSemaphoreTake(tickerDataMutex, 5 / portTICK_PERIOD_MS) == pdTRUE) {
+        localTicker = tickerCache;
+        xSemaphoreGive(tickerDataMutex);
+    }
+    if (sportsDataMutex != nullptr && xSemaphoreTake(sportsDataMutex, 5 / portTICK_PERIOD_MS) == pdTRUE) {
+        localMlb = mlbCache;
+        localNhl = nhlCache;
+        xSemaphoreGive(sportsDataMutex);
+    }
+
+    DynamicJsonDocument doc(2048); // Increased size for additional nested sections
     doc["ip"] = getUiIpAddress();
 
     JsonObject mining = doc.createNestedObject("mining");
@@ -246,14 +568,60 @@ static void handleStatusJson() {
     mining["valids"] = miningData.valids;
     mining["uptime"] = miningData.timeMining;
     mining["bestDiff"] = miningData.bestDiff;
-    mining["submitAttempts"] = "--";
-    mining["poolDifficulty"] = "--";
+    mining["submitAttempts"] = miningData.completedShares;
+    mining["poolDifficulty"] = String(currentPoolDifficultyLive, 6);
 
     JsonObject pool = doc.createNestedObject("pool");
-    pool["workersCount"] = 0;
-    pool["workersHash"] = "--";
-    pool["bestDifficulty"] = "--";
+    pool["workersCount"] = pData.workersCount;
+    pool["workersHash"] = sanitizeMetric(pData.workersHash, "--");
+    pool["bestDifficulty"] = sanitizeMetric(pData.bestDifficulty, "--");
     pool["apiUrl"] = getPoolAPIUrl();
+
+    JsonObject blockchain = doc.createNestedObject("blockchain");
+    blockchain["btcPrice"] = bitcoin_price;
+    blockchain["blockHeight"] = current_block;
+    blockchain["difficulty"] = sanitizeMetric(gData.difficulty, "--");
+    blockchain["halfHourFee"] = gData.halfHourFee;
+    blockchain["remainingBlocks"] = gData.remainingBlocks;
+    blockchain["progressPercent"] = gData.progressPercent;
+
+    JsonObject sentiment = doc.createNestedObject("sentiment");
+    sentiment["greeting"] = sanitizeMetric(localTicker.greeting, "Welcome, Patrick!");
+    sentiment["score"] = sanitizeMetric(localTicker.sentiment, "--");
+    sentiment["direction"] = sanitizeMetric(localTicker.direction, "--");
+    sentiment["category"] = sanitizeMetric(localTicker.category, "--");
+    sentiment["recommendation"] = sanitizeMetric(localTicker.recommendation, "--");
+    sentiment["btcDirection"] = sanitizeMetric(localTicker.btcDirection, "--");
+    sentiment["btcEntry"] = sanitizeMetric(localTicker.btcEntry, "--");
+    sentiment["btcTakeProfit"] = sanitizeMetric(localTicker.btcTakeProfit, "--");
+    sentiment["xrpDirection"] = sanitizeMetric(localTicker.xrpDirection, "--");
+    sentiment["xrpEntry"] = sanitizeMetric(localTicker.xrpEntry, "--");
+    sentiment["xrpTakeProfit"] = sanitizeMetric(localTicker.xrpTakeProfit, "--");
+
+    JsonObject sports = doc.createNestedObject("sports");
+    JsonObject mlb = sports.createNestedObject("mlb");
+    mlb["hasGame"] = localMlb.hasGame;
+    mlb["shortName"] = sanitizeMetric(localMlb.shortName, "");
+    mlb["status"] = sanitizeMetric(localMlb.status, "");
+    mlb["stlScore"] = sanitizeMetric(localMlb.stlScore, "");
+    mlb["oppScore"] = sanitizeMetric(localMlb.oppScore, "");
+    mlb["oppAbbrev"] = sanitizeMetric(localMlb.oppAbbrev, "");
+    mlb["isStlHome"] = localMlb.isStlHome;
+
+    JsonObject nhl = sports.createNestedObject("nhl");
+    nhl["hasGame"] = localNhl.hasGame;
+    nhl["shortName"] = sanitizeMetric(localNhl.shortName, "");
+    nhl["status"] = sanitizeMetric(localNhl.status, "");
+    nhl["stlScore"] = sanitizeMetric(localNhl.stlScore, "");
+    nhl["oppScore"] = sanitizeMetric(localNhl.oppScore, "");
+    nhl["oppAbbrev"] = sanitizeMetric(localNhl.oppAbbrev, "");
+    nhl["isStlHome"] = localNhl.isStlHome;
+
+    JsonObject sys = doc.createNestedObject("system");
+    sys["freeHeap"] = ESP.getFreeHeap();
+    sys["minFreeHeap"] = ESP.getMinFreeHeap();
+    sys["heapSize"] = ESP.getHeapSize();
+    sys["maxAllocHeap"] = ESP.getMaxAllocHeap();
 
     String payload;
     serializeJson(doc, payload);
@@ -271,6 +639,10 @@ static void ensureSettingsWebServerStarted() {
     settingsWebServer.on("/settings", HTTP_GET, handleSettingsPage);
     settingsWebServer.on("/save", HTTP_POST, handleSettingsSave);
     settingsWebServer.on("/api/status", HTTP_GET, handleStatusJson);
+    settingsWebServer.onNotFound([]() {
+        settingsWebServer.sendHeader("Location", "/", true);
+        settingsWebServer.send(302, "text/plain", "");
+    });
     settingsWebServer.begin();
     settingsWebServerStarted = true;
     Serial.println("Settings web server started on http://" + getUiIpAddress());
@@ -517,10 +889,13 @@ void init_WifiManager()
             //Could be break forced after edditing, so save new config
             Serial.println("failed to connect and hit timeout");
             Settings.PoolAddress = pool_text_box.getValue();
+            if (Settings.PoolAddress.length() > 79) Settings.PoolAddress = Settings.PoolAddress.substring(0, 79);
             Settings.PoolPort = atoi(port_text_box_num.getValue());
             normalizePoolEndpoint(Settings.PoolAddress, Settings.PoolPort);
-            strncpy(Settings.PoolPassword, password_text_box.getValue(), sizeof(Settings.PoolPassword));
-            strncpy(Settings.BtcWallet, addr_text_box.getValue(), sizeof(Settings.BtcWallet));
+            strncpy(Settings.PoolPassword, password_text_box.getValue(), sizeof(Settings.PoolPassword) - 1);
+            Settings.PoolPassword[sizeof(Settings.PoolPassword) - 1] = '\0';
+            strncpy(Settings.BtcWallet, addr_text_box.getValue(), sizeof(Settings.BtcWallet) - 1);
+            Settings.BtcWallet[sizeof(Settings.BtcWallet) - 1] = '\0';
             Settings.Timezone = atoi(time_text_box_num.getValue());
             //Serial.println(save_stats_to_nvs.getValue());
             Settings.saveStats = (strncmp(save_stats_to_nvs.getValue(), "T", 1) == 0);
@@ -551,10 +926,13 @@ void init_WifiManager()
             if (shouldSaveConfig) {
                 // Save new config            
                 Settings.PoolAddress = pool_text_box.getValue();
+                if (Settings.PoolAddress.length() > 79) Settings.PoolAddress = Settings.PoolAddress.substring(0, 79);
                 Settings.PoolPort = atoi(port_text_box_num.getValue());
                 normalizePoolEndpoint(Settings.PoolAddress, Settings.PoolPort);
-                strncpy(Settings.PoolPassword, password_text_box.getValue(), sizeof(Settings.PoolPassword));
-                strncpy(Settings.BtcWallet, addr_text_box.getValue(), sizeof(Settings.BtcWallet));
+                strncpy(Settings.PoolPassword, password_text_box.getValue(), sizeof(Settings.PoolPassword) - 1);
+                Settings.PoolPassword[sizeof(Settings.PoolPassword) - 1] = '\0';
+                strncpy(Settings.BtcWallet, addr_text_box.getValue(), sizeof(Settings.BtcWallet) - 1);
+                Settings.BtcWallet[sizeof(Settings.BtcWallet) - 1] = '\0';
                 Settings.Timezone = atoi(time_text_box_num.getValue());
                 // Serial.println(save_stats_to_nvs.getValue());
                 Settings.saveStats = (strncmp(save_stats_to_nvs.getValue(), "T", 1) == 0);
@@ -578,13 +956,15 @@ void init_WifiManager()
         Serial.println("WiFi connected");
         Serial.print("IP address: ");
         Serial.println(WiFi.localIP());
+        WiFi.setSleep(false); // Disable WiFi sleep mode for connection stability
+
 
 
         // Lets deal with the user config values
 
         // Copy the string value
         Settings.PoolAddress = pool_text_box.getValue();
-        //strncpy(Settings.PoolAddress, pool_text_box.getValue(), sizeof(Settings.PoolAddress));
+        if (Settings.PoolAddress.length() > 79) Settings.PoolAddress = Settings.PoolAddress.substring(0, 79);
         Serial.print("PoolString: ");
         Serial.println(Settings.PoolAddress);
 
@@ -595,12 +975,14 @@ void init_WifiManager()
         Serial.println(Settings.PoolPort);
 
         // Copy the string value
-        strncpy(Settings.PoolPassword, password_text_box.getValue(), sizeof(Settings.PoolPassword));
+        strncpy(Settings.PoolPassword, password_text_box.getValue(), sizeof(Settings.PoolPassword) - 1);
+        Settings.PoolPassword[sizeof(Settings.PoolPassword) - 1] = '\0';
         Serial.print("poolPassword: ");
         Serial.println(Settings.PoolPassword);
 
         // Copy the string value
-        strncpy(Settings.BtcWallet, addr_text_box.getValue(), sizeof(Settings.BtcWallet));
+        strncpy(Settings.BtcWallet, addr_text_box.getValue(), sizeof(Settings.BtcWallet) - 1);
+        Settings.BtcWallet[sizeof(Settings.BtcWallet) - 1] = '\0';
         Serial.print("btcString: ");
         Serial.println(Settings.BtcWallet);
 
@@ -627,7 +1009,7 @@ void init_WifiManager()
 
     // Copy the string value
     Settings.PoolAddress = pool_text_box.getValue();
-    //strncpy(Settings.PoolAddress, pool_text_box.getValue(), sizeof(Settings.PoolAddress));
+    if (Settings.PoolAddress.length() > 79) Settings.PoolAddress = Settings.PoolAddress.substring(0, 79);
     Serial.print("PoolString: ");
     Serial.println(Settings.PoolAddress);
 
@@ -638,12 +1020,14 @@ void init_WifiManager()
     Serial.println(Settings.PoolPort);
 
     // Copy the string value
-    strncpy(Settings.PoolPassword, password_text_box.getValue(), sizeof(Settings.PoolPassword));
+    strncpy(Settings.PoolPassword, password_text_box.getValue(), sizeof(Settings.PoolPassword) - 1);
+    Settings.PoolPassword[sizeof(Settings.PoolPassword) - 1] = '\0';
     Serial.print("poolPassword: ");
     Serial.println(Settings.PoolPassword);
 
     // Copy the string value
-    strncpy(Settings.BtcWallet, addr_text_box.getValue(), sizeof(Settings.BtcWallet));
+    strncpy(Settings.BtcWallet, addr_text_box.getValue(), sizeof(Settings.BtcWallet) - 1);
+    Settings.BtcWallet[sizeof(Settings.BtcWallet) - 1] = '\0';
     Serial.print("btcString: ");
     Serial.println(Settings.BtcWallet);
 
@@ -683,6 +1067,7 @@ void wifiManagerProcess() {
     if (newStatus != oldStatus) {
         if (newStatus == WL_CONNECTED) {
             Serial.println("CONNECTED - Current ip: " + WiFi.localIP().toString());
+            WiFi.setSleep(false); // Disable WiFi sleep mode for connection stability
             ensureSettingsWebServerStarted();
         } else {
             Serial.print("[Error] - current status: ");

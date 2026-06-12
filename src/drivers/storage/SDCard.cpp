@@ -153,6 +153,11 @@ bool SDCard::loadConfigFile(TSettings* Settings)
                     } else {
                         Settings->autoScreenRotation = false;
                     }
+                    if (json.containsKey(JSON_KEY_SCROLL_INT)) {
+                        Settings->autoScrollInterval = json[JSON_KEY_SCROLL_INT].as<int>();
+                    } else {
+                        Settings->autoScrollInterval = DEFAULT_SCROLL_INT;
+                    }
                     // Serial.printf("Carteira Lida SD:%s\n", Settings.BtcWallet);       
                     Serial.printf("Carteira Lida SDs:%s\n", Settings->BtcWallet);                       
                     return true;
